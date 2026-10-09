@@ -20,6 +20,10 @@ packaging/windows/file_version_info.txt
 *.dmg
 packaging/macos/serp3d.icns
 packaging/macos/*.iconset/
-
+*.env
 # Graft local code graph (regenerable cache, like node_modules)
 graft/
+.refact/
+.history/
+.vscode/
+micromamba.exe

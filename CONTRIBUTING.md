@@ -14,6 +14,21 @@ python3 -m venv .venv
 .venv/bin/serp3d                # run the app
 ```
 
+Using windows and micromamba:
+
+```bash
+micromamba create -f environment.yml
+micromamba activate Serpentine3D
+micromamba update  -f environment.yml
+```
+Open a new terminal, then...⬇️
+```
+python -m venv .venv
+pip install -r requirements.txt  --no-cache-dir 
+pip install -e ".[dev]"
+serp3d
+```
+
 Python ≥ 3.10. The heavy dependency is `cadquery-ocp` (OpenCASCADE 7.9
 prebuilt as pybind11 bindings) — it's a large wheel, but there is nothing
 to compile.

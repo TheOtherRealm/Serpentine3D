@@ -1,0 +1,6 @@
+name: Serpentine3D
+channels:
+  - conda-forge
+dependencies:
+- python
+- pip
