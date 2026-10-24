@@ -6,5 +6,15 @@
         "mcp"
       ]
     }
+  },
+  {
+    "mcpServers": {
+      "serpentine3d": {
+        "command": "C:\\Users\\Someone\\AppData\\Local\\Programs\\Serpentine3D\\serp3d.exe",
+        "args": [
+          "--mcp"
+        ]
+      }
+    }
   }
 }

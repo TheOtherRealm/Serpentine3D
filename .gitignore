@@ -27,3 +27,5 @@ graft/
 .history/
 .vscode/
 micromamba.exe
+tread.py
+make_contours.py

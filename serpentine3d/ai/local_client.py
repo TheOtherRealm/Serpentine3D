@@ -3,17 +3,56 @@
 The agent keeps one provider-independent transcript. This adapter translates
 tool results and images at the HTTP boundary, retaining every tool-call ID.
 """
-
 from __future__ import annotations
-
 import json
 from urllib.parse import urlsplit
-
 import httpx
-
 from .client import AiError, _friendly_http_error
-
+import pprint
+from icecream import ic
 DEFAULT_ENDPOINT = "http://127.0.0.1:1234"
+def dump_recursive(obj, indent=0, visited=None):
+    if visited is None:
+        visited = set()
+    
+    spacing = "  " * indent
+    obj_id = id(obj)
+    
+    # Prevent infinite loops from cyclic references
+    if obj_id in visited:
+        print(f"{spacing}<Recursion Loop Detected>")
+        return
+        
+    visited.add(obj_id)
+    
+    # Handle primitive/simple types directly
+    if isinstance(obj, (str, int, float, bool, type(None))):
+        print(f"{spacing}{repr(obj)}")
+        return
+
+    # Handle Dictionaries
+    if isinstance(obj, dict):
+        print(f"{spacing}dict:")
+        for k, v in obj.items():
+            print(f"{spacing}  {k}:")
+            dump_recursive(v, indent + 2, visited)
+            
+    # Handle Lists, Tuples, and Sets
+    elif isinstance(obj, (list, tuple, set)):
+        print(f"{spacing}{type(obj).__name__}:")
+        for index, item in enumerate(obj):
+            print(f"{spacing}  [{index}]:")
+            dump_recursive(item, indent + 2, visited)
+            
+    # Handle Custom Objects
+    elif hasattr(obj, "__dict__"):
+        print(f"{spacing}object {obj.__class__.__name__}:")
+        for k, v in vars(obj).items():
+            print(f"{spacing}  .{k}:")
+            dump_recursive(v, indent + 2, visited)
+    else:
+        # Fallback for objects without __dict__ (like system objects or slots)
+        print(f"{spacing}{repr(obj)}")
 
 
 def server_root(endpoint: str) -> str:
@@ -38,7 +77,7 @@ def discover_models(endpoint: str) -> list[dict]:
     """
     root = server_root(endpoint)
     try:
-        with httpx.Client(timeout=httpx.Timeout(20, connect=5)) as client:
+        with httpx.Client(timeout=httpx.Timeout(120, connect=5)) as client:
             response = client.get(root + "/api/v1/models")
             native = response.status_code not in (404, 405, 501)
             if not native:
@@ -77,7 +116,7 @@ class LocalClient:
         self.endpoint = server_root(endpoint)
         self.model = model
         self.vision = vision
-        self._client = httpx.Client(timeout=httpx.Timeout(120, connect=10))
+        self._client = httpx.Client(timeout=httpx.Timeout(None))
 
     def close(self):
         self._client.close()
@@ -89,6 +128,8 @@ class LocalClient:
         return AiError(_friendly_http_error(status, body))
 
     def _request_error(self, exc):
+        ic(self,exc)
+        dump_recursive(self)
         return AiError(f"LM Studio request failed: {exc}. Check that its local server and model are running.")
 
     def _messages(self, system: str, messages: list[dict]) -> list[dict]:

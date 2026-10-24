@@ -395,7 +395,7 @@ class MainWindow(QMainWindow):
             return
         for dock in column:
             dock.setFixedWidth(width)
-        self.layout().activate()
+        self.layout().activate() # pyright: ignore[reportOptionalMemberAccess]
         for dock in column:
             dock.setMinimumWidth(0)
             dock.setMaximumWidth(_UNLIMITED)
