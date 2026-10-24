@@ -1,16 +1,21 @@
 """Paper-space layouts: sheets, detail views, and annotations.
 
-Dimensions are millimetres of paper. A detail's scale is stored as the
-denominator N of 1:N — one millimetre of paper shows N model units
-(Serpentine3D treats one model unit as one millimetre for drafting).
+Dimensions are millimetres of paper. A detail keeps its scale as
+`scale_denom`, the model units one millimetre of paper shows. The scale it
+is written as is a ratio of real lengths, so the two differ by the
+document's units: 1:4 in an inch document is 4/25.4 inches to the paper
+millimetre (`format_scale`, `parse_scale`).
 """
 
 from __future__ import annotations
 
 import copy
 import math
+import re
 import uuid
 from dataclasses import dataclass, field, fields, replace
+
+from ..utils.units import TO_MM, parse_length
 
 # landscape (width, height) in mm
 PAPER_SIZES = {
@@ -24,6 +29,26 @@ PAPER_SIZES = {
 }
 
 STANDARD_SCALES = [1, 2, 5, 10, 20, 50, 100, 200, 500]
+
+# The scales a detail is offered at, in the order they are offered. Metric
+# drawings and workshop drawings in inches give theirs as ratios; architects
+# and engineers in feet and inches name theirs by a length of paper and the
+# length of model it stands for, and a scale on the list is labelled by the
+# name it has there. No ratio is on a list twice: 3" = 1'-0" is the 1:4
+# already on it.
+METRIC_SCALES = ("1:1", "1:2", "1:5", "1:10", "1:20", "1:50", "1:100",
+                 "1:200")
+IMPERIAL_SCALES = (
+    "1:1", "1:2", "1:4", "1:8",
+    '1" = 1\'-0"', '3/4" = 1\'-0"', '1/2" = 1\'-0"', '3/8" = 1\'-0"',
+    '1/4" = 1\'-0"', '3/16" = 1\'-0"', '1/8" = 1\'-0"', '1/16" = 1\'-0"',
+    '1" = 10\'', '1" = 20\'', '1" = 50\'', '1" = 100\'',
+)
+
+
+def scale_presets(units: str) -> tuple:
+    """The scales a detail is offered at in a document of `units`."""
+    return IMPERIAL_SCALES if units in ("in", "ft") else METRIC_SCALES
 
 
 def _uid() -> str:
@@ -43,25 +68,26 @@ class DetailView:
     elevation: float = math.radians(89.9)
     target: list = field(default_factory=lambda: [0.0, 0.0, 0.0])
     perspective: bool = False
-    scale_denom: float = 10.0               # 1:10
+    scale_denom: float = 10.0               # model units to the paper mm
     perspective_distance: float = 60.0      # camera distance when perspective
     display_mode: str = "wireframe"         # wireframe|shaded|hidden|technical
     locked: bool = False
     show_border: bool = True
     show_label: bool = True
     section_offset: float | None = None   # cut plane distance from target
+    # layers this detail leaves out, as Rhino's per-detail visibility does
+    # (a sublayer goes with its parent); the model itself is untouched
+    hidden_layers: list = field(default_factory=list)
 
     def contains(self, px: float, py: float) -> bool:
         return (self.x <= px <= self.x + self.w
                 and self.y <= py <= self.y + self.h)
 
-    def scale_text(self) -> str:
-        d = self.scale_denom
+    def scale_text(self, units: str) -> str:
+        """The scale as it is written in a document of `units`."""
         if self.perspective:
             return "perspective"
-        if d >= 1:
-            return f"1:{d:g}"
-        return f"{1 / d:g}:1"
+        return format_scale(self.scale_denom, units)
 
 
 @dataclass
@@ -106,11 +132,47 @@ class Leader:
     style: str = ""
 
 
-# Every fill the app can draw, in the order they are offered. A layer
-# names one of these as the material it is hatched with, so the list a
-# layer can be set to and the list the `hatch` command offers are one
-# list and cannot drift apart.
-HATCH_PATTERNS = ("lines", "cross", "solid")
+# Every fill the app has of its own, in the order they are offered. A
+# layer names one of these as the material it is hatched with, so the
+# list a layer can be set to and the list the `hatch` command offers are
+# one list and cannot drift apart. The same list as
+# hatch_patterns.BUILTIN_NAMES, kept here so this module needs no numpy.
+HATCH_PATTERNS = ("lines", "cross", "solid", "dash", "dots", "plus",
+                  "squares", "triangles", "brick")
+
+# What a layer's material can be filled with where a section cuts it: any
+# of the patterns, or none at all. None is a material's choice not to be
+# hatched, which a hatch drawn by hand cannot make, so layers offer it and
+# the hatch command does not.
+SECTION_FILLS = ("none", *HATCH_PATTERNS)
+
+
+def hatch_patterns_of(scene) -> tuple:
+    """Every pattern a hatch in this drawing can be drawn with: the app's
+    own, then those loaded into the drawing from a .pat file (#92)."""
+    library = getattr(scene, "hatch_patterns", None) or {}
+    return (*HATCH_PATTERNS, *library)
+
+
+def section_fills_of(scene) -> tuple:
+    """Every fill a layer in this drawing can name for its material."""
+    return ("none", *hatch_patterns_of(scene))
+
+
+def pattern_label(name: str) -> str:
+    """A pattern's name as a list shows it: the app's own capitalised,
+    as they always were, a loaded one as its file spells it."""
+    return name.capitalize() if name.lower() in SECTION_FILLS else name
+
+
+def pattern_named(scene, text) -> str | None:
+    """The pattern a typed or picked name means in this drawing, spelled
+    the way it is kept, or None for one it has no pattern by."""
+    key = str(text or "").strip().lower()
+    for name in section_fills_of(scene):
+        if name.lower() == key:
+            return name
+    return None
 
 
 @dataclass
@@ -118,9 +180,10 @@ class Hatch:
     id: str = field(default_factory=_uid)
     points: list = field(default_factory=list)   # closed polygon [[x,y],...]
     holes: list = field(default_factory=list)    # rings left empty, same form
-    pattern: str = "lines"                       # one of HATCH_PATTERNS
+    pattern: str = "lines"                       # see hatch_patterns_of
     angle: float = 45.0
     spacing: float = 3.0                         # mm
+    color: list | None = None                    # [r, g, b] 0..1; None: ink
 
 
 @dataclass
@@ -325,42 +388,105 @@ def cut_patterns(data: dict) -> list:
             for _oid, pattern, _region in (data.get("cut_by_obj") or [])]
 
 
-def cut_hatching(regions: list, cx: float, cy: float, s: float,
-                 angle: float = 45.0, spacing: float = 2.5,
-                 patterns: list | None = None) -> tuple:
-    """A detail's section cuts on the paper: what to fill, what to outline.
+@dataclass(frozen=True)
+class SectionFill:
+    """How a cut face is drawn: the pattern it is filled with, the angle
+    and spacing of its lines on the paper (degrees, millimetres), and the
+    colour they are drawn in, as an (r, g, b) in 0..1, or None for the ink
+    the rest of the sheet is drawn in. Then the line round the face: its
+    width on the paper in millimetres, 0 for none, and its colour, the
+    same way (#82). `definition` is the pattern a name from the drawing's
+    library stands for (#92), and `background` the colour the face is
+    flooded with under its lines, or None to leave it as it was (#91)."""
+    pattern: str = "lines"
+    angle: float = 45.0
+    spacing: float = 2.5
+    color: tuple | None = None
+    cut_line_width: float = 0.5
+    cut_line_color: tuple | None = None
+    definition: object = None
+    background: tuple | None = None
+
+
+# Past this many segments a face's pattern is too fine for its size, and
+# the sheet draws what it has rather than locking up drawing the rest.
+MAX_PAPER_SEGMENTS = 50000
+
+
+def section_drawing(regions: list, cx: float, cy: float, s: float,
+                    fills: list | None = None) -> tuple:
+    """A detail's section cuts on the paper, ready to draw.
 
     `regions` arrive in the detail's projector frame, in model units;
-    `cx`, `cy` and `s` place them on the sheet. Returns the hatch
-    segments for every region, the loops to draw a line around, and the
-    regions to flood rather than line, all in paper millimetres.
+    `cx`, `cy` and `s` place them on the sheet. `fills` is aligned with
+    `regions` and says how each cut face is filled, off whatever it was
+    cut from (`SectionFill`); a region with none gets plain lines.
 
-    `patterns` is aligned with `regions` and says what each cut face is
-    made of, off the layer it was cut from: "cross" goes over the face a
-    second time square to the first, "solid" fills it in instead, and
-    anything else (a layer with nothing to say, or a pattern out of a
-    file this build cannot draw) gets the plain lines it always got.
-    Solid comes back on its own because it is not a set of segments: it
-    is the rings themselves, holes and all, for a painter to flood.
+    Returns three things, all in paper millimetres:
+    - the hatch lines, as (colour, segments) with one entry per colour
+      in the order the colours first come up, so a painter changes pen
+      once a colour rather than once a face;
+    - the outlines, as (colour, width, rings) with one entry per pen in
+      the order the pens first come up, every ring of every face that
+      has a cut line; a face whose cut line is 0 wide is left out;
+    - the faces to flood, as (colour, rings) with the bore among the
+      rings: solid is not a set of segments, it is the face itself, and
+      a face with a background is flooded in it under its lines.
 
-    The screen and the plot both draw this, and they used to work it out
-    separately. One of them was always going to be a version behind.
+    "cross" goes over a face a second time square to the first, "none"
+    leaves it outlined and empty, a pattern from the drawing's library is
+    drawn family by family, and anything else (no pattern, or one out of
+    a file this drawing has no pattern for) gets the plain lines it always
+    got. The screen and the plot both draw this, and they used to work
+    it out separately: one of them was always going to be a version
+    behind.
     """
-    fill, loops, solid = [], [], []
+    from .hatch_patterns import fill_segments
+    fills = fills or []
+    lines: dict = {}
+    outlines: dict = {}
+    floods = []
     for i, region in enumerate(regions):
         paper = [[(cx + px * s, cy + py * s) for px, py in ring]
                  for ring in region if len(ring) >= 3]
         if not paper:
             continue
-        pattern = patterns[i] if patterns and i < len(patterns) else ""
-        if pattern == "solid":
-            solid.append(paper)
-        else:
-            fill.extend(hatch_region(paper, angle, spacing))
-            if pattern == "cross":
-                fill.extend(hatch_region(paper, angle + 90.0, spacing))
-        loops.extend(paper)
-    return fill, loops, solid
+        fill = fills[i] if i < len(fills) else SectionFill()
+        solid = fill.pattern == "solid" or getattr(fill.definition, "solid",
+                                                   False)
+        if solid:
+            floods.append((fill.color, paper))
+        elif fill.pattern != "none":
+            if fill.background is not None:
+                floods.append((fill.background, paper))
+            lines.setdefault(fill.color, []).extend(fill_segments(
+                paper, fill.definition, fill.pattern, fill.angle,
+                fill.spacing, limit=MAX_PAPER_SEGMENTS))
+        if fill.cut_line_width > 0:
+            outlines.setdefault((fill.cut_line_color, fill.cut_line_width),
+                                []).extend(paper)
+    return [(color, segs) for color, segs in lines.items() if segs], \
+        [(color, width, rings)
+         for (color, width), rings in outlines.items()], floods
+
+
+def cut_hatching(regions: list, cx: float, cy: float, s: float,
+                 angle: float = 45.0, spacing: float = 2.5,
+                 patterns: list | None = None) -> tuple:
+    """A detail's section cuts on the paper, all in the one ink: the hatch
+    segments, the loops to outline and the faces to flood.
+
+    `patterns` is aligned with `regions` and names each face's pattern;
+    `angle` and `spacing` go for every face. `section_drawing` is the
+    same answer with each face's own angle, spacing and colour.
+    """
+    fills = [SectionFill(patterns[i] if patterns and i < len(patterns)
+                         else "", angle, spacing)
+             for i in range(len(regions))]
+    lines, outlines, floods = section_drawing(regions, cx, cy, s, fills)
+    return ([seg for _color, segs in lines for seg in segs],
+            [ring for _color, _width, rings in outlines for ring in rings],
+            [rings for _color, rings in floods])
 
 
 DEFAULT_STYLES = {
@@ -999,6 +1125,8 @@ def enclosing_polygon(polylines: list, px: float, py: float):
 class Layout:
     id: str = field(default_factory=_uid)
     name: str = "Layout"
+    number: str = ""                     # the sheet number, A-101; may be ""
+    group: str | None = None             # the SheetGroup it sits in, if any
     paper_w: float = 420.0
     paper_h: float = 297.0
     margin: float = 10.0
@@ -1018,7 +1146,8 @@ class Layout:
     _counters: dict = field(default_factory=dict, repr=False, compare=False)
 
     # the sheet itself, as against anything put on it
-    _PAPER = ("id", "name", "paper_w", "paper_h", "margin", "_counters")
+    _PAPER = ("id", "name", "number", "group", "paper_w", "paper_h",
+              "margin", "_counters")
 
     def is_empty(self) -> bool:
         """True if nothing has been drawn or placed on the paper.
@@ -1051,11 +1180,46 @@ class Layout:
                     item.id = _uid()        # bare lists, with no id to move
         return dup
 
+    def copied_details(self, dup: Layout) -> list:
+        """(this sheet's detail id, the copy's) for each detail of a sheet
+        `duplicate` made from this one: the copy keeps the order, and
+        only the ids moved."""
+        return [(old.id, new.id) for old, new in zip(self.details,
+                                                     dup.details)]
+
     def detail_at(self, px: float, py: float) -> DetailView | None:
         for d in reversed(self.details):        # topmost first
             if d.contains(px, py):
                 return d
         return None
+
+    def convert_units(self, factor: float, rescaled: bool):
+        """The document's units changed, one old unit being `factor` new.
+
+        Every scale on the sheet is a ratio of real lengths, and stays the
+        ratio it was: a detail at 1:4 is at 1:4 in the new units too, and a
+        dimension or a scale bar reads lengths at the scale it did.
+        `rescaled` says the model was scaled by `factor` to keep its real
+        size, so what looks at it or is anchored to it moves with it, and
+        the sheet plots as it did.
+        """
+        for det in self.details:
+            det.scale_denom *= factor
+            if rescaled:
+                det.target = [c * factor for c in det.target]
+                det.perspective_distance *= factor
+                if det.section_offset is not None:
+                    det.section_offset *= factor
+        for dim in [*self.dims, *self.rdims]:
+            dim.scale_denom *= factor
+        for bar in self.scale_bars:
+            bar[2] *= factor
+        if rescaled:
+            for dim in self.dims:
+                if dim.m1 is not None:
+                    dim.m1 = [c * factor for c in dim.m1]
+                if dim.m2 is not None:
+                    dim.m2 = [c * factor for c in dim.m2]
 
     def add(self, shape, name: str | None = None) -> PaperObject:
         """Put geometry on the paper, in millimetres.
@@ -1082,6 +1246,84 @@ class Layout:
 
     def clone(self) -> "Layout":
         return copy.deepcopy(self)
+
+
+@dataclass
+class SheetGroup:
+    """A group of sheets, the way a set of drawings is bound: Plans,
+    Sections, and groups inside those (#38)."""
+    id: str = field(default_factory=_uid)
+    name: str = "Group"
+    parent: str | None = None            # the group this one sits in
+
+
+def sheet_tree(layouts: list, groups: list) -> list:
+    """The sheets and their groups as a tree, in the sheets' own order.
+
+    [(kind, item, children)], kind "group" or "sheet" (children [] for a
+    sheet). The order is `layouts`', the tab strip's and the print's: a
+    group sits where its first sheet does, so moving a group is moving its
+    sheets, and an empty group comes at the end of where it was made. A
+    sheet whose group is gone stands on its own, and a group that turns
+    out to sit inside itself is taken to sit at the top.
+    """
+    by_id = {g.id: g for g in groups}
+    entries: dict = {None: []}
+    placed: set = set()
+
+    def parent_of(group, seen):
+        parent = group.parent
+        if parent not in by_id or parent in seen:
+            return None
+        return parent
+
+    def place(gid, seen=()):
+        if gid in placed:
+            return
+        seen = set(seen) | {gid}
+        parent = parent_of(by_id[gid], seen)
+        if parent is not None:
+            place(parent, seen)
+        placed.add(gid)
+        entries.setdefault(parent, []).append(("group", by_id[gid]))
+        entries.setdefault(gid, [])
+
+    for lay in layouts:
+        gid = lay.group if lay.group in by_id else None
+        if gid is not None:
+            place(gid)
+        entries.setdefault(gid, []).append(("sheet", lay))
+    for group in groups:
+        place(group.id)
+
+    def build(key):
+        return [(kind, item, build(item.id) if kind == "group" else [])
+                for kind, item in entries.get(key, [])]
+    return build(None)
+
+
+def flatten_sheets(tree: list) -> list:
+    """The sheets of a `sheet_tree`, depth first: the order they go in."""
+    out = []
+    for kind, item, children in tree:
+        if kind == "group":
+            out.extend(flatten_sheets(children))
+        else:
+            out.append(item)
+    return out
+
+
+def sheet_label(layout) -> str:
+    """How a sheet is named in a list: its number, then its name."""
+    return f"{layout.number}  {layout.name}" if layout.number else layout.name
+
+
+def sheet_groups_to_json(groups: list) -> list:
+    return [vars(g).copy() for g in groups]
+
+
+def sheet_groups_from_json(data: list) -> list:
+    return [_rebuild(SheetGroup, d) for d in data or []]
 
 
 def unique_layout_name(layouts, base: str) -> str:
@@ -1154,6 +1396,7 @@ def layouts_to_json(layouts: list) -> list:
     for lay in layouts:
         out.append({
             "id": lay.id, "name": lay.name,
+            "number": lay.number, "group": lay.group,
             "paper_w": lay.paper_w, "paper_h": lay.paper_h,
             "margin": lay.margin,
             "details": [vars(d).copy() for d in lay.details],
@@ -1175,6 +1418,8 @@ def layouts_from_json(data: list) -> list:
     layouts = []
     for ld in data or []:
         lay = Layout(id=ld.get("id", _uid()), name=ld.get("name", "Layout"),
+                     number=str(ld.get("number") or ""),
+                     group=ld.get("group") or None,
                      paper_w=ld.get("paper_w", 420.0),
                      paper_h=ld.get("paper_h", 297.0),
                      margin=ld.get("margin", 10.0))
@@ -1194,20 +1439,56 @@ def layouts_from_json(data: list) -> list:
     return layouts
 
 
-def parse_scale(text: str) -> float | None:
-    """'1:50' -> 50, '2:1' -> 0.5, '50' -> 50."""
-    text = text.strip().lower().replace(" ", "")
-    if ":" in text:
-        a, _, b = text.partition(":")
+def _scale_ratio(text: str, units: str) -> float | None:
+    """The ratio of real lengths a typed scale says: N of 1:N."""
+    if "=" in text:
+        paper, _, model = text.partition("=")
+        # an architect's 1-1/2" is the 1 1/2" a length is typed as
+        paper = re.sub(r"(\d)\s*-\s*(\d+/\d+)", r"\1 \2", paper)
+        a, b = parse_length(paper, units), parse_length(model, units)
+        ratio = b / a if (a or 0) > 0 and (b or 0) > 0 else None
+    else:
+        text = text.strip().lower().replace(" ", "")
         try:
-            a, b = float(a), float(b)
-            if a <= 0 or b <= 0:
-                return None
-            return b / a
+            if ":" in text:
+                a, _, b = text.partition(":")
+                a, b = float(a), float(b)
+                ratio = b / a if a > 0 and b > 0 else None
+            else:
+                ratio = float(text)
         except ValueError:
             return None
-    try:
-        v = float(text)
-        return v if v > 0 else None
-    except ValueError:
+    if ratio is None or not 0 < ratio < math.inf:
         return None
+    return ratio
+
+
+def parse_scale(text: str, units: str) -> float | None:
+    """A typed scale, as the `scale_denom` it sets in a document of `units`.
+
+    A ratio is of real lengths, so it means the same in any units: '1:50'
+    is a fiftieth of real size, '2:1' twice it, a bare '50' is 1:50, and in
+    an inch document 1:50 is 50/25.4 inches to the paper millimetre.
+    Architects and engineers name theirs by a length of paper and the
+    length of model it stands for, 1/4" = 1'-0" (1:48) or 1" = 20'
+    (1:240); a length there without units is in the document's.
+    """
+    ratio = _scale_ratio(text, units)
+    return None if ratio is None else ratio / TO_MM[units]
+
+
+# what each scale on offer says, which is the same in any units
+_PRESET_RATIOS = {name: _scale_ratio(name, "mm")
+                  for name in (*METRIC_SCALES, *IMPERIAL_SCALES)}
+
+
+def format_scale(denom: float, units: str) -> str:
+    """A `scale_denom` written as the ratio of real lengths it is, 1:N or
+    N:1, or by its name when it is a scale on offer in `units`."""
+    ratio = denom * TO_MM[units]
+    for name in scale_presets(units):
+        if math.isclose(_PRESET_RATIOS[name], ratio, rel_tol=1e-9):
+            return name
+    if ratio >= 1:
+        return f"1:{ratio:g}"
+    return f"{1 / ratio:g}:1"

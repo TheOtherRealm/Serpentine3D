@@ -41,14 +41,22 @@ KEYBOARD_ONLY = {
         "the size of the sheet, which is not in the model at all",
     ("text", "Text height (mm)"):
         "annotation height on the printed sheet, not model space",
-    ("hatch", "Line spacing (mm)"):
-        "hatch density on the printed sheet, not model space",
+    ("hatch", "Line spacing"):
+        "how dense the filling is over an area that is already drawn, "
+        "with nothing on screen for a drag to measure it against; on a "
+        "sheet it is paper millimetres besides",
     ("dimstyle", "Text height (mm)"):
         "a style setting with no geometry on screen to drag against",
     ("dimstyle", "Arrow size (mm)"):
         "a style setting with no geometry on screen to drag against",
     ("layer", "Edge width on screen (pixels)"):
         "a width in screen pixels, which has no length in the model",
+    ("layer", "Hatch spacing on paper (mm)"):
+        "hatch density on the printed sheet, whatever the detail's scale, "
+        "so no length in the model measures it",
+    ("sectionhatch", "Hatch spacing on paper (mm)"):
+        "hatch density on the printed sheet, whatever the detail's scale, "
+        "so no length in the model measures it",
     ("detailsection",
      "Cut plane distance from the detail target (toward the viewer)"):
         "you are inside a layout detail, so the cursor is on the paper "
@@ -86,6 +94,9 @@ def _commands():
     for path in sorted(glob.glob(os.path.join(
             ROOT, "serpentine3d", "commands", "*.py"))):
         tree = ast.parse(open(path, encoding="utf-8").read())
+        forms = {n.name: _form_requests(n) for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and n.name.endswith("_form")}
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -113,9 +124,46 @@ def _commands():
                     prompt = str(call.args[0].value)
                 kwargs = {k.arg for k in call.keywords if k.arg}
                 reqs.append((rtype, prompt, kwargs, sub.lineno))
+            reqs.extend(_form_fields(forms, node))
             reqs.sort(key=lambda r: r[3])
             if reqs:
                 out.append((os.path.basename(path), name, reqs))
+    return out
+
+
+def _form_requests(node):
+    """The requests a `*_form` helper builds for its command to yield.
+
+    A form asks several things at once (commands/base.py: FormReq), so
+    its prompts are written in a helper rather than yielded one by one.
+    They are prompts all the same and this audit has to see them.
+    """
+    reqs = []
+    for call in ast.walk(node):
+        if not isinstance(call, ast.Call):
+            continue
+        rtype = getattr(call.func, "id", None)
+        if not rtype or not rtype.endswith("Req") or rtype == "FormReq":
+            continue
+        prompt = ""
+        if call.args and isinstance(call.args[0], ast.Constant):
+            prompt = str(call.args[0].value)
+        elif call.args and isinstance(call.args[0], ast.JoinedStr):
+            # f"Line spacing{unit}": the words of it that are always there
+            prompt = "".join(v.value for v in call.args[0].values
+                             if isinstance(v, ast.Constant))
+        kwargs = {k.arg for k in call.keywords if k.arg}
+        reqs.append((rtype, prompt, kwargs, call.lineno))
+    return reqs
+
+
+def _form_fields(forms: dict, node) -> list:
+    """The form helpers this command calls, as its own requests."""
+    called = {getattr(c.func, "id", "") for c in ast.walk(node)
+              if isinstance(c, ast.Call)}
+    out = []
+    for helper in sorted(called & forms.keys()):
+        out.extend(forms[helper])
     return out
 
 

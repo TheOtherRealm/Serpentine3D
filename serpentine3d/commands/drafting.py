@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import numpy as np
 
+from ..core import clipping
 from ..core import geometry as g
 from ..core.layout import (
-    PAPER_SIZES, DetailView, Layout, LinearDim, TextNote, parse_scale,
+    PAPER_SIZES, DetailView, Layout, LinearDim, TextNote, format_scale,
+    hatch_patterns_of, parse_scale, pattern_label, pattern_named,
     unique_layout_name,
 )
+from ..utils.units import TO_MM
 # a detail view named "front" should look where the front view looks
 from ..ui.camera import STANDARD_VIEWS as _VIEW_ANGLES
 from .base import (
-    FileReq, NumberReq, OptionReq, PointReq, SelectReq, TextReq, TextEditorReq,
-    command, has_text_editor,
+    FileReq, FormField, FormReq, NumberReq, OptionReq, PointReq, SelectReq,
+    TextReq, TextEditorReq, command, has_text_editor,
 )
+from .regions import coplanar_curves, pick_regions
 
 
 def _window(ctx):
@@ -108,6 +112,8 @@ def cmd_layout(ctx):
     elif action == "Duplicate":
         copy = lay.duplicate(
             unique_layout_name(scene.layouts, f"{lay.name} copy"))
+        # a copied detail is cut by the planes the original is cut by
+        clipping.carry_views(scene, lay.copied_details(copy))
         scene.layouts.append(copy)
         ctx.echo(f"Duplicated as '{copy.name}'.")
     scene.notify()
@@ -159,7 +165,9 @@ def cmd_detail(ctx):
         return
         yield  # pragma: no cover
     owner = _window(ctx) or ctx
-    view, denom = getattr(owner, "_detail_placement_settings", ("Top", 100.0))
+    units = ctx.scene.units
+    # remembered as the ratio it was, which is the same in any units
+    view, ratio = getattr(owner, "_detail_placement_settings", ("Top", 100.0))
     bounds = ctx.scene.bbox()
     target = [0.0, 0.0, 0.0]
     if bounds is not None:
@@ -168,7 +176,8 @@ def cmd_detail(ctx):
     # Keep one identity throughout placement, for the detail rendering cache.
     detail = DetailView(azimuth=az, elevation=el, target=target,
                         perspective=(view == "Perspective"),
-                        scale_denom=float(denom), display_mode="wireframe")
+                        scale_denom=float(ratio) / TO_MM[units],
+                        display_mode="wireframe")
     if bounds is not None:
         import math
         radius = math.dist(bounds[0], bounds[1]) / 2 or 10.0
@@ -188,7 +197,7 @@ def cmd_detail(ctx):
     while True:
         stage = ("First corner of detail (on the paper)" if c1 is None
                  else "Opposite corner")
-        setting = "Fit model" if fit_model else detail.scale_text()
+        setting = "Fit model" if fit_model else detail.scale_text(units)
         value = yield PointReq(
             f"{stage} · {view} · {setting}",
             extra_options=("View", "Scale", "Fit"),
@@ -202,11 +211,11 @@ def cmd_detail(ctx):
             detail.perspective = view == "Perspective"
         elif isinstance(value, str) and value == "Scale":
             scale_text = yield TextReq("Scale (e.g. 1:10, 1:50)",
-                                       default=detail.scale_text())
-            denom = parse_scale(scale_text)
+                                       default=detail.scale_text(units))
+            denom = parse_scale(scale_text, units)
             if denom is None:
                 ctx.echo(f"Could not parse scale '{scale_text}' — keeping "
-                         f"{detail.scale_text()}.")
+                         f"{detail.scale_text(units)}.")
             else:
                 detail.scale_denom = float(denom)
                 fit_model = False
@@ -226,12 +235,13 @@ def cmd_detail(ctx):
     _frame_to(c2)
     detail.display_mode = "hidden"
     lay.details.append(detail)
-    owner._detail_placement_settings = (view, detail.scale_denom)
+    owner._detail_placement_settings = (view,
+                                        detail.scale_denom * TO_MM[units])
     lv = ctx.viewport.layout_view
     lv.selected = [("detail", detail)]
     lv.corners = []
     ctx.scene.notify("layouts")
-    ctx.echo(f"Detail created: {view} at {detail.scale_text()} "
+    ctx.echo(f"Detail created: {view} at {detail.scale_text(units)} "
              f"({w:g}x{h:g}mm). Edit it in Properties or double-click to enter.")
 
 
@@ -242,15 +252,16 @@ def cmd_detailscale(ctx):
         ctx.echo("Enter a detail first (double-click it).")
         return
         yield  # pragma: no cover
+    units = ctx.scene.units
     text = yield TextReq("New scale (e.g. 1:20)",
-                         default=detail.scale_text())
-    denom = parse_scale(text)
+                         default=detail.scale_text(units))
+    denom = parse_scale(text, units)
     if denom is None:
         ctx.echo(f"Could not parse '{text}'.")
         return
     detail.scale_denom = float(denom)
     ctx.scene.notify()
-    ctx.echo(f"Detail scale set to {detail.scale_text()}.")
+    ctx.echo(f"Detail scale set to {detail.scale_text(units)}.")
 
 
 @command("detailmode")
@@ -362,7 +373,22 @@ def cmd_make2d(ctx):
              "individual curves.")
 
 
-@command("exportpdf", aliases=("print", "pdf"), mutates=False)
+@command("printsheets", aliases=("print", "plot"), mutates=False)
+def cmd_printsheets(ctx):
+    """Print sheets, or save them as one PDF, choosing them from the set.
+
+    With a window this is the print dialog (#38). Scripts and a headless
+    run have no dialog to show, so they get exportpdf's prompts instead."""
+    win = _window(ctx)
+    if win is None or not hasattr(win, "print_sheets"):
+        yield from cmd_exportpdf(ctx)
+        return
+    win.print_sheets()
+    return
+    yield  # pragma: no cover
+
+
+@command("exportpdf", aliases=("pdf",), mutates=False)
 def cmd_exportpdf(ctx):
     lay = _active_layout(ctx)
     if lay is None:
@@ -464,7 +490,8 @@ def cmd_dim(ctx):
     ctx.scene.notify()
     measured = length * scale_denom
     ctx.echo(f"Dimension placed: {measured:g}"
-             + (f" (anchored to detail at {detail.scale_text()})"
+             + (f" (anchored to detail at "
+                f"{detail.scale_text(ctx.scene.units)})"
                 if dim.detail_id else " mm on paper"))
 
 @command("leader", space="paper")
@@ -490,14 +517,22 @@ def cmd_leader(ctx):
     ctx.echo("Leader placed.")
 
 
-def _pattern_choices() -> list[str]:
+def _pattern_choices(ctx) -> list[str]:
     """The fills on offer, spelled the way a prompt spells them.
 
     Read off the same list a layer is set from, so a fill the app learns
-    to draw is offered here without anybody remembering to come back.
+    to draw is offered here without anybody remembering to come back, and
+    a pattern loaded from a .pat file is offered beside the app's own.
     """
-    from ..core.layout import HATCH_PATTERNS
-    return [p.capitalize() for p in HATCH_PATTERNS]
+    return [pattern_label(p) for p in hatch_patterns_of(ctx.scene)]
+
+
+def _pattern_answer(ctx, answer) -> tuple:
+    """(name, definition) for the pattern a prompt was answered with: the
+    name as the drawing keeps it, and the HatchPattern a loaded pattern
+    is drawn from, None for the app's own."""
+    name = pattern_named(ctx.scene, answer) or str(answer).lower()
+    return name, ctx.scene.hatch_pattern(name)
 
 
 def _layer_pattern(ctx) -> str:
@@ -505,10 +540,14 @@ def _layer_pattern(ctx) -> str:
 
     A layer is a material and a material has a fill, so hatching a wall
     on the Concrete layer is a click and an Enter rather than the same
-    decision taken again on every region. A layer with nothing to say
-    leaves the command where it has always been, on lines.
+    decision taken again on every region. A layer whose material has no
+    fill leaves the command where it has always been, on lines: a hatch
+    drawn by hand is there to be seen.
     """
-    return (ctx.scene.layers.current.hatch or "lines").capitalize()
+    fill = ctx.scene.layers.current.hatch
+    if fill.lower() not in [p.lower() for p in hatch_patterns_of(ctx.scene)]:
+        fill = "lines"
+    return pattern_label(fill)
 
 
 # "paper" still, though it hatches in the model too: the space only says what
@@ -524,27 +563,39 @@ def cmd_hatch(ctx):
         yield from _hatch_in_the_model(ctx)
         return
     from ..core.layout import Hatch
-    choices = _pattern_choices()
+    choices = _pattern_choices(ctx)
     offered = _layer_pattern(ctx)
     pts = []
     first = yield PointReq("First corner of hatch region "
                            "(or click inside detail linework)",
                            choices={"Mode": ["Corners", "Region"]})
     if ctx.opt("Mode", "Corners") == "Region":
-        found = _region_at(ctx, lay, first[0], first[1])
+        found = _region_and_fill_at(ctx, lay, first[0], first[1])
         if found is None:
             ctx.echo("No closed linework region found under that point.")
             return
-        poly, holes, material = found
+        poly, holes, material, fill = found
+        # Its lines lie the way the cut's already do, in the cut's
+        # colour; off a cut, the way the layer says.
+        look = fill if fill is not None else _layer_look(ctx)
         # The face is already drawn in its material, so that is what the
         # prompt opens on: hatching a cut for real should not change what
-        # the cut is made of. Off a cut, the layer answers as it always did.
-        pattern = yield OptionReq("Pattern", options=choices,
-                                  default=material.capitalize() or offered)
-        lay.hatches.append(Hatch(points=[list(p) for p in poly],
-                                 holes=[[list(p) for p in ring]
-                                        for ring in holes],
-                                 pattern=pattern.lower()))
+        # the cut is made of. Off a cut, or on one left empty, the layer
+        # answers as it always did.
+        material = pattern_label(material)
+        rings = ([list(p) for p in poly],
+                 [[list(p) for p in ring] for ring in holes])
+        pattern = yield OptionReq(
+            "Pattern", options=choices,
+            default=material if material in choices else offered,
+            preview_fn=lambda answer: Hatch(
+                points=rings[0], holes=rings[1],
+                pattern=_pattern_answer(ctx, answer)[0], angle=look.angle,
+                spacing=look.spacing, color=_color_list(look.color)))
+        lay.hatches.append(Hatch(points=rings[0], holes=rings[1],
+                                 pattern=_pattern_answer(ctx, pattern)[0],
+                                 angle=look.angle, spacing=look.spacing,
+                                 color=_color_list(look.color)))
         ctx.scene.notify()
         empty = f", {len(holes)} left empty" if holes else ""
         ctx.echo(f"Region hatched ({len(poly)} vertices{empty}).")
@@ -559,23 +610,35 @@ def cmd_hatch(ctx):
         if p is None:
             break
         pts.append([p[0], p[1]])
-    pattern = yield OptionReq("Pattern", options=choices, default=offered)
-    spacing = 3.0
-    angle = 45.0
-    if pattern != "Solid":
-        spacing = yield NumberReq("Line spacing (mm)", default=3.0,
-                                  minimum=0.2)
-        angle = yield NumberReq("Angle (degrees)", default=45.0)
-    lay.hatches.append(Hatch(points=pts, pattern=pattern.lower(),
-                             angle=angle, spacing=spacing))
+    look = _layer_look(ctx)
+
+    def sheet_hatch(answers):
+        return Hatch(points=pts,
+                     pattern=_pattern_answer(ctx, answers["pattern"])[0],
+                     angle=float(answers["angle"]),
+                     spacing=float(answers["spacing"]),
+                     color=_color_list(look.color))
+
+    answers = yield _hatch_form(ctx, spacing=look.spacing, angle=look.angle,
+                                pattern=offered, unit=" (mm)", minimum=0.2,
+                                live=sheet_hatch)
+    hatch = sheet_hatch(answers)
+    lay.hatches.append(hatch)
     ctx.scene.notify()
-    ctx.echo(f"Hatch placed ({pattern.lower()}).")
+    ctx.echo(f"Hatch placed ({hatch.pattern}).")
 
 
 def _hatch_in_the_model(ctx):
-    """Hatch the closed planar curves picked, a curve inside another being a
-    hole in it, one hatch object for each region they make. The curves are
-    kept, as Rhino keeps them, and what was made is left selected."""
+    """Hatch the closed planar curves picked, one hatch per region.
+
+    Curves that run through each other leave regions nobody can guess at,
+    so those are picked: Rhino's boundary mode (#45), and the pick is the
+    one CurveBoolean asks. Anywhere the answer is obvious there is no
+    question at all: one closed curve is its own boundary, curves lying
+    apart make one hatch each, and a curve inside another is its hole.
+    The curves are kept, as Rhino keeps them, and what was made is left
+    selected.
+    """
     from ..core.hatch import HatchShape
     objs = yield SelectReq("Select closed planar curves to hatch",
                            kinds=("curve",))
@@ -583,7 +646,7 @@ def _hatch_in_the_model(ctx):
     for obj in objs:
         try:
             g.planar_face(obj.shape)          # closed and flat, or it says
-            boundaries.append(obj.shape)
+            boundaries.append(obj)
         except (g.GeometryError, Exception):  # noqa: BLE001
             refused.append(obj.name)
     if refused:
@@ -591,27 +654,48 @@ def _hatch_in_the_model(ctx):
                  f"{', '.join(refused)}.")
     if not boundaries:
         return
-    try:
-        regions = g.planar_regions(boundaries)
-    except g.GeometryError as exc:
-        ctx.echo(f"Could not make a region to hatch: {exc}")
+    if _curves_overlap(boundaries):
+        regions = yield from _regions_to_fill(ctx, boundaries)
+    else:
+        try:
+            regions = g.planar_regions([o.shape for o in boundaries])
+        except g.GeometryError as exc:
+            ctx.echo(f"Could not make a region to hatch: {exc}")
+            return
+    if not regions:
         return
-    pattern = yield OptionReq("Pattern", options=_pattern_choices(),
-                              default=_layer_pattern(ctx))
-    pattern = pattern.lower()
-    spacing, angle = 1.0, 45.0
-    if pattern != "solid":
-        size = max(float(np.ptp(np.array(g.bbox(r)), axis=0).max())
-                   for r in regions)
-        spacing = yield NumberReq("Line spacing", default=_round_spacing(size),
-                                  minimum=1e-6)
-        angle = yield NumberReq("Angle (degrees)", default=45.0)
+    size = max(float(np.ptp(np.array(g.bbox(r)), axis=0).max())
+               for r in regions)
     xdir = tuple(ctx.cplane.xdir) if ctx.cplane is not None else None
+
+    def hatches(answers):
+        pattern, definition = _pattern_answer(ctx, answers["pattern"])
+        return pattern, [HatchShape(region, pattern,
+                                    angle=float(answers["angle"]),
+                                    spacing=float(answers["spacing"]),
+                                    xdir=xdir, definition=definition)
+                         for region in regions]
+
+    def live(answers):
+        # What OK would make, while the popup is still open; a spacing too
+        # fine to draw shows the regions instead, as before.
+        from ..core.hatch import HatchGroup
+        try:
+            made = hatches(answers)[1]
+        except g.GeometryError:
+            return _region_ghost(regions)
+        return made[0] if len(made) == 1 else HatchGroup(made)
+
+    answers = yield _hatch_form(ctx, spacing=_round_spacing(size),
+                                preview=_region_ghost(regions), live=live)
+    pattern, definition = _pattern_answer(ctx, answers["pattern"])
     made = []
     for region in regions:
         try:
-            shape = HatchShape(region, pattern, angle=float(angle),
-                               spacing=float(spacing), xdir=xdir)
+            shape = HatchShape(region, pattern,
+                               angle=float(answers["angle"]),
+                               spacing=float(answers["spacing"]),
+                               xdir=xdir, definition=definition)
         except g.GeometryError as exc:
             ctx.echo(f"Not hatched: {exc}")
             continue
@@ -620,6 +704,253 @@ def _hatch_in_the_model(ctx):
         ctx.select_result(made)
         ctx.echo(f"{len(made)} hatch{'es' if len(made) != 1 else ''} "
                  f"placed ({pattern}).")
+
+
+def _curves_overlap(curves) -> bool:
+    """Whether any two of these outlines cross, so there is a choice.
+
+    Boundary mode is only worth asking about when the answer is not
+    already obvious. Curves that lie apart make one hatch each and a
+    curve inside another is its hole, which is what the command has
+    always done and what Rhino does; it is two outlines running through
+    each other that leave regions nobody can guess at.
+
+    Only pairs whose boxes meet are intersected, so a sheet of separate
+    outlines costs a box comparison per pair rather than a boolean, and
+    is filled without asking however many outlines it has.
+    """
+    if len(curves) < 2:
+        return False
+    faces, areas, boxes = [], [], []
+    for obj in curves:
+        try:
+            face = g.planar_face(obj.shape)
+        except (g.GeometryError, Exception):          # noqa: BLE001
+            return True            # cannot tell: let the pick decide
+        faces.append(face)
+        areas.append(g.surface_area(face))
+        boxes.append(g.bbox(face))
+    lo, hi = np.array(boxes, float).transpose(1, 0, 2)
+    tol = g.tol()
+    # Every pair's boxes at once. Inclusive, so a flat box (every curve on
+    # z=0 has one) still meets the boxes beside it on its own plane.
+    meet = np.all((lo[:, None] <= hi[None] + tol)
+                  & (lo[None] <= hi[:, None] + tol), axis=2)
+    for i, j in zip(*np.nonzero(np.triu(meet, k=1))):
+        try:
+            common = g.surface_area(
+                g.boolean_intersection(faces[i], faces[j]))
+        except (g.GeometryError, Exception):          # noqa: BLE001
+            continue               # they do not meet at all
+        if common <= tol:
+            continue               # apart, or touching along an edge
+        # Sharing all of one of them is nesting, not crossing.
+        if abs(common - areas[i]) > tol and abs(common - areas[j]) > tol:
+            return True
+    return False
+
+
+def _hatch_form(ctx, spacing: float, angle: float = 45.0, pattern=None,
+                unit: str = "", minimum: float = 1e-6, preview=None,
+                live=None):
+    """What a hatch is made of, asked as one thing (#45).
+
+    A window shows the three together, so the pattern, how close its lines
+    run and which way they lie can be read off and changed in one place,
+    the way Rhino's hatch dialog does. Without one they are three prompts
+    in a row, as they always were, and a solid pattern is not asked about
+    a spacing or an angle it has no use for.
+
+    `preview` is what is about to be filled, ghosted while the question
+    stands. A pick of several curves shows the regions as they are
+    clicked; where there was nothing to pick there would otherwise be
+    nothing to see, and which area a pattern is about to land on is worth
+    as much then as it is during the pick.
+
+    `live(answers)` is the hatch the answers would make, shown while the
+    popup is open and redrawn as it changes. At the prompt each answer
+    shows the hatch it would make with the rest left as they stand.
+    """
+    def not_solid(answers):
+        name, definition = _pattern_answer(ctx, answers.get("pattern", ""))
+        return name != "solid" and not (definition and definition.solid)
+
+    first = pattern or _layer_pattern(ctx)
+    defaults = {"pattern": first, "spacing": float(spacing),
+                "angle": float(angle)}
+
+    def ghost(name):
+        if live is not None:
+            return lambda value: live({**defaults, name: value})
+        return None if preview is None else (lambda _value: preview)
+
+    return FormReq(
+        "Hatch", title="Hatch",
+        fields=(
+            FormField("pattern",
+                      OptionReq("Pattern", options=_pattern_choices(ctx),
+                                default=first,
+                                preview_fn=ghost("pattern"))),
+            FormField("spacing",
+                      NumberReq(f"Line spacing{unit}", default=float(spacing),
+                                minimum=float(minimum),
+                                preview_fn=ghost("spacing")),
+                      when=not_solid),
+            FormField("angle",
+                      NumberReq("Angle (degrees)", default=float(angle),
+                                preview_fn=ghost("angle")),
+                      when=not_solid),
+        ),
+        preview_fn=live)
+
+
+def _region_ghost(regions):
+    """The area about to be hatched, as one shape to ghost."""
+    if not regions:
+        return None
+    if len(regions) == 1:
+        return regions[0]
+    try:
+        return g.make_compound(list(regions))
+    except Exception:                                 # noqa: BLE001
+        return regions[0]
+
+
+def _regions_to_fill(ctx, curves):
+    """The regions of several curves that the pick kept, or an empty list.
+
+    Boundary mode. Curves off the first one's plane are dropped with a
+    word, and if that leaves a single curve it is its own boundary again.
+    """
+    try:
+        coplanar, origin, normal = coplanar_curves(ctx, curves)
+    except (g.GeometryError, Exception) as exc:    # noqa: BLE001
+        ctx.echo(f"Could not make a region to hatch: {exc}")
+        return []
+    if len(coplanar) < 2:
+        try:
+            return g.planar_regions([o.shape for o in coplanar])
+        except g.GeometryError as exc:
+            ctx.echo(f"Could not make a region to hatch: {exc}")
+            return []
+    try:
+        regions = g.curve_regions([o.shape for o in coplanar])
+    except g.GeometryError as exc:
+        ctx.echo(f"Could not make a region to hatch: {exc}")
+        return []
+    if not regions:
+        ctx.echo("The curves share no usable regions.")
+        return []
+    kept = yield from pick_regions(
+        ctx, regions, origin, normal,
+        prompt="Pick region to hatch (Enter to finish)")
+    if not kept:
+        ctx.echo("No regions picked, nothing hatched.")
+        return []
+    return [regions[i] for i in kept]
+
+
+@command("hatchpatterns", aliases=("loadpat", "loadhatchpatterns"))
+def cmd_hatchpatterns(ctx):
+    """The drawing's hatch patterns (#92): Load the patterns in a .pat
+    file, Delete one that was loaded, or Purge every loaded one nothing
+    is drawn with. The app's own patterns are always there.
+
+    AutoCAD's acad.pat and acadiso.pat, a Revit export and most patterns
+    found online are .pat files. What is loaded is saved with the drawing,
+    and offered wherever a hatch or a layer's section hatch is picked.
+    """
+    # Patterns are the drawing's, not the picked objects': whatever was
+    # picked, often the very hatch a pattern is being loaded for, stays.
+    held = list(ctx.selection.ids)
+    action = yield OptionReq("Hatch patterns",
+                             options=["Load", "Delete", "Purge"],
+                             default="Load")
+    if action == "Delete":
+        yield from _delete_pattern(ctx)
+    elif action == "Purge":
+        _purge_patterns(ctx)
+    else:
+        yield from _load_patterns(ctx)
+    if held:
+        ctx.select_result(held)
+
+
+def _load_patterns(ctx):
+    import os
+    from ..core.hatch_patterns import PatternError, merge_into, read_pat
+    path = yield FileReq("Hatch pattern file", default="~/",
+                         title="Load hatch patterns",
+                         filters="Hatch patterns (*.pat);;All files (*)")
+    path = os.path.abspath(os.path.expanduser(path.strip()))
+    source = os.path.splitext(os.path.basename(path))[0]
+    try:
+        patterns = read_pat(path)
+    except (OSError, PatternError) as exc:
+        ctx.echo(f"Could not read {os.path.basename(path)}: {exc}")
+        return
+    named = merge_into(ctx.scene.hatch_patterns, patterns, source=source)
+    # what the drawing calls them now, in the file's order, for the window
+    # that asked for the file to switch to the first
+    ctx.scene.loaded_patterns = list(dict.fromkeys(named.values()))
+    ctx.scene.notify()
+    if not named:
+        ctx.echo(f"No hatch patterns in {os.path.basename(path)}.")
+        return
+    shown = [new if new == old else f"{old} as {pattern_label(new)}"
+             for old, new in named.items()]
+    listed = ", ".join(shown[:8]) + (", …" if len(shown) > 8 else "")
+    ctx.echo(f"Loaded {len(named)} hatch pattern"
+             f"{'s' if len(named) != 1 else ''} from "
+             f"{os.path.basename(path)}: {listed}.")
+
+
+def _delete_pattern(ctx):
+    """Take a loaded pattern out of the drawing. Whatever names it draws
+    as lines from then on, as a name the drawing has no pattern by always
+    has; a hatch in the model keeps drawing it, since it carries its own."""
+    names = list(ctx.scene.hatch_patterns)
+    if not names:
+        ctx.echo("No loaded hatch patterns to delete; the app's own "
+                 "always stay.")
+        return
+    name = yield OptionReq("Pattern to delete", options=names,
+                           default=names[0])
+    name = next((n for n in names if n.lower() == str(name).lower()), None)
+    if name is None:
+        return
+    users = ctx.scene.hatch_pattern_users(name)
+    del ctx.scene.hatch_patterns[name]
+    ctx.scene.notify()
+    ctx.echo(f"Deleted hatch pattern {name}.")
+    redrawn = {k: v for k, v in users.items() if k != "hatch"}
+    if any(redrawn.values()):
+        ctx.echo(f"{_users_text(redrawn)} named it, and now draw lines.")
+    if users.get("hatch"):
+        ctx.echo(f"{_users_text({'hatch': users['hatch']})} in the model "
+                 "keep drawing it.")
+
+
+def _purge_patterns(ctx):
+    """Every loaded pattern nothing in the drawing is drawn with."""
+    unused = [n for n in ctx.scene.hatch_patterns
+              if not any(ctx.scene.hatch_pattern_users(n).values())]
+    for name in unused:
+        del ctx.scene.hatch_patterns[name]
+    if unused:
+        ctx.scene.notify()
+        ctx.echo(f"Purged {len(unused)} unused hatch pattern"
+                 f"{'s' if len(unused) != 1 else ''}: {', '.join(unused)}.")
+    else:
+        ctx.echo("Every loaded hatch pattern is in use.")
+
+
+def _users_text(users: dict) -> str:
+    words = {"layer": ("layer", "layers"), "object": ("object", "objects"),
+             "sheet": ("sheet hatch", "sheet hatches"),
+             "hatch": ("hatch", "hatches")}
+    parts = [f"{n} {words[kind][n != 1]}" for kind, n in users.items() if n]
+    return " and ".join(parts)
 
 
 def _round_spacing(size: float) -> float:
@@ -720,12 +1051,13 @@ def cmd_scalebar(ctx):
         return
         yield  # pragma: no cover
     pos = yield PointReq("Scale bar position")
+    units = ctx.scene.units
     detail = lay.detail_at(pos[0], pos[1])
     denom = detail.scale_denom if detail and not detail.perspective else (
-        lay.details[0].scale_denom if lay.details else 10.0)
+        lay.details[0].scale_denom if lay.details else 10.0 / TO_MM[units])
     lay.scale_bars.append([pos[0], pos[1], denom])
     ctx.scene.notify()
-    ctx.echo(f"Scale bar placed (1:{denom:g}).")
+    ctx.echo(f"Scale bar placed ({format_scale(denom, units)}).")
 
 
 @command("detailsection")
@@ -799,8 +1131,29 @@ def cmd_exportsvg(ctx):
     ctx.echo(f"Exported sheet '{lay.name}' to {path}.")
 
 
+def _layer_look(ctx):
+    """How the layer being drawn on hatches: its angle, its spacing on the
+    paper and its colour, the pattern aside (`_layer_pattern` has that)."""
+    layer = ctx.scene.layers.current
+    from ..core.layout import SectionFill
+    return SectionFill(layer.hatch, layer.hatch_angle, layer.hatch_spacing,
+                       ctx.scene.layers.hatch_rgb(layer.id))
+
+
+def _color_list(color):
+    """A colour as a paper hatch keeps it: [r, g, b], or None for ink."""
+    return None if color is None else [float(c) for c in color[:3]]
+
+
 def _region_at(ctx, lay, px, py):
-    """The closed area under a point, as (points, holes, material).
+    """The closed area under a point, as (points, holes, material); see
+    `_region_and_fill_at`, which has the fill as well."""
+    found = _region_and_fill_at(ctx, lay, px, py)
+    return None if found is None else found[:3]
+
+
+def _region_and_fill_at(ctx, lay, px, py):
+    """The closed area under a point, as (points, holes, material, fill).
 
     A section cut is a ring of material with the bore punched out of it,
     and a hatch dropped on the wall has to leave the bore alone. Any
@@ -809,7 +1162,8 @@ def _region_at(ctx, lay, px, py):
     The material is the fill the face is already drawn in, off the layer
     it was cut from, so hatching a cut face for real does not change
     what it is made of. Linework that is not a cut has none, and neither
-    has the bore: a hole is not made of anything.
+    has the bore: a hole is not made of anything. The fill is the whole
+    of how the face is drawn (`SectionFill`), or None off a cut.
     """
     from ..core.layout import cut_patterns, enclosing_polygon
     detail = lay.detail_at(px, py)
@@ -837,11 +1191,14 @@ def _region_at(ctx, lay, px, py):
     # holes. Land in one of the holes and that hole is what you pointed
     # at, so it is the region and it has nothing punched out of it.
     patterns = cut_patterns(data)
+    region_fills = getattr(view, "_region_fills", None)
+    fills = region_fills(data) if region_fills is not None else []
     for i, region in enumerate(regions):
         if found == region[0][:-1]:
             return (found, [loop[:-1] for loop in region[1:]],
-                    patterns[i] if i < len(patterns) else "")
-    return found, [], ""
+                    patterns[i] if i < len(patterns) else "",
+                    fills[i] if i < len(fills) else None)
+    return found, [], "", None
 
 
 def _layout_view(ctx):

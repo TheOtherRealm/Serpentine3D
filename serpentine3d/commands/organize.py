@@ -289,7 +289,10 @@ def cmd_what(ctx):
 
 @command("matchprops", aliases=("matchproperties",))
 def cmd_matchprops(ctx):
-    """Copy layer, colour and material from one object to others."""
+    """Copy an object's layer, colour, material, print width and hatch.
+
+    From one object to others, the section hatch and print width coming
+    over as overrides only where the source had them."""
     src = yield SelectReq("Select source object", max_count=1)
     targets = yield SelectReq("Select objects to change",
                               allow_preselected=False)
@@ -300,7 +303,10 @@ def cmd_matchprops(ctx):
     with ctx.scene.batched():
         for o in targets:
             ctx.scene.update(o.id, layer_id=s.layer_id, color=s.color,
-                             material=dict(s.material) if s.material else None)
+                             material=dict(s.material) if s.material else None,
+                             print_width=s.print_width,
+                             section_fill=(dict(s.section_fill)
+                                           if s.section_fill else None))
     ctx.echo(f"Matched properties on {len(targets)} object(s) from {s.name}.")
 
 
@@ -316,6 +322,122 @@ def cmd_linetype(ctx):
                             default="ByLayer")
     ctx.scene.update_many([o.id for o in objs], linetype=style)
     ctx.echo(f"Set linetype '{style}' on {len(objs)} object(s).")
+
+
+@command("printwidth", aliases=("plotweight", "printweight"))
+def cmd_printwidth(ctx):
+    """Set the pen width selected objects plot with, or ByLayer.
+
+    A width of their own in millimetres, Default for the printer's, or
+    ByLayer to take their layer's again."""
+    objs = yield SelectReq("Select objects to set print width")
+    if not objs:
+        ctx.echo("Nothing selected.")
+        return
+    answer = yield TextReq("Print width in mm, Default or ByLayer",
+                           default="ByLayer")
+    text = (answer or "ByLayer").strip().lower().removesuffix("mm").strip()
+    if text in ("bylayer", "by layer"):
+        width, said = None, "ByLayer"
+    elif text == "default":
+        width, said = 0.0, "Default"
+    else:
+        try:
+            width = max(0.0, float(text))
+        except ValueError:
+            ctx.echo(f"Not a print width: '{answer}'.")
+            return
+        said = f"{width:g} mm"
+    ctx.scene.update_many([o.id for o in objs], print_width=width)
+    ctx.echo(f"Set print width {said} on {len(objs)} object(s).")
+
+
+@command("setusertext", aliases=("setattributeusertext",))
+def cmd_setusertext(ctx):
+    """Set a key of user text on the selected objects, as Rhino's
+    SetUserText does.
+
+    The key, then its value; no value takes the key away. A key already
+    there under another case is the same key, and keeps its spelling."""
+    from ..core import user_text
+    objs = yield SelectReq("Select objects to set user text on")
+    if not objs:
+        ctx.echo("Nothing selected.")
+        return
+    key = ((yield TextReq("Key")) or "").strip()
+    if not key:
+        ctx.echo("A key needs a name.")
+        return
+    value = yield TextReq(f"Value for {key} (Enter for none, which takes "
+                          "the key away)", default="")
+    with ctx.scene.batched():
+        for o in objs:
+            ctx.scene.update(o.id, user_text=user_text.with_value(
+                o.user_text, key, value))
+    ctx.echo(f"Set {key} = {value} on {len(objs)} object(s)." if value
+             else f"Took {key} off {len(objs)} object(s).")
+
+
+@command("getusertext", mutates=False)
+def cmd_getusertext(ctx):
+    """Report the user text on the selected objects, as Rhino's
+    GetUserText does: one key's value, or with Enter every key."""
+    from ..core import user_text
+    objs = yield SelectReq("Select objects to read user text from")
+    if not objs:
+        ctx.echo("Nothing selected.")
+        return
+    key = ((yield TextReq("Key (Enter for all of them)", default=""))
+           or "").strip()
+    for o in objs:
+        text = o.user_text or {}
+        if key:
+            held = user_text.key_in(text, key)
+            ctx.echo(f"{o.name}: {held} = {text[held]}" if held is not None
+                     else f"{o.name} has no {key}.")
+        elif text:
+            ctx.echo("\n".join([f"{o.name}:", *(f"  {k} = {v}"
+                                                for k, v in text.items())]))
+        else:
+            ctx.echo(f"{o.name} has no user text.")
+
+
+@command("sectionhatch", aliases=("sectionstyle",))
+def cmd_sectionhatch(ctx):
+    """Set how a section cut through selected objects is filled.
+
+    ByLayer, or a hatch of their own, which starts from the first one's
+    layer's angle, spacing and colour."""
+    from ..core.layers import section_fill_dict
+    from ..core.layout import pattern_label, pattern_named, section_fills_of
+    objs = yield SelectReq("Select objects to set section hatch")
+    if not objs:
+        ctx.echo("Nothing selected.")
+        return
+    pattern = yield OptionReq(
+        "Section hatch",
+        options=["ByLayer", *(pattern_label(p)
+                              for p in section_fills_of(ctx.scene))],
+        default="ByLayer")
+    if pattern == "ByLayer":
+        ctx.scene.update_many([o.id for o in objs], section_fill=None)
+        ctx.echo(f"{len(objs)} object(s) hatched by layer.")
+        return
+    layer = ctx.scene.layers.get(objs[0].layer_id)
+    angle, spacing = layer.hatch_angle, layer.hatch_spacing
+    pattern = pattern_named(ctx.scene, pattern) or pattern
+    if pattern.lower() not in ("none", "solid"):
+        angle = yield NumberReq("Hatch angle (degrees)", default=angle)
+        spacing = yield NumberReq("Hatch spacing on paper (mm)",
+                                  default=spacing, minimum=0.2)
+    fill = section_fill_dict(pattern, angle, spacing, layer.hatch_color,
+                             layer.cut_line_width, layer.cut_line_color,
+                             layer.hatch_background)
+    # one notification, not one an object; each gets its own copy
+    with ctx.scene.batched():
+        for o in objs:
+            ctx.scene.update(o.id, section_fill=dict(fill))
+    ctx.echo(f"Section hatch {fill['pattern']} on {len(objs)} object(s).")
 
 
 def _reorder(scene, objs, mode: str):

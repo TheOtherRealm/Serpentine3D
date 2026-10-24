@@ -14,6 +14,22 @@ from . import fileio
 from .core import geometry as g
 
 
+# What `layers(action="style")` can set, in the order it sets them, and the
+# LayerManager setter each goes through.
+_LAYER_STYLE = {
+    "linetype": "set_linetype",
+    "print_width": "set_print_width",
+    "screen_width": "set_lineweight",
+    "hatch": "set_hatch",
+    "hatch_angle": "set_hatch_angle",
+    "hatch_spacing": "set_hatch_spacing",
+    "hatch_color": "set_hatch_color",
+    "hatch_background": "set_hatch_background",
+    "cut_line_width": "set_cut_line_width",
+    "cut_line_color": "set_cut_line_color",
+}
+
+
 class ApiError(Exception):
     pass
 
@@ -81,7 +97,7 @@ class SerpApi:
         if shape is None or self.scene.get(obj.id) is None:
             return None
         mn, mx = g.bbox(shape)
-        return {
+        row = {
             "id": obj.id,
             "name": obj.name,
             "kind": obj.kind,
@@ -92,6 +108,17 @@ class SerpApi:
             "locked": bool(obj.locked),
             "bbox": [list(mn), list(mx)],
         }
+        if obj.user_text:
+            # only where there is some: most objects carry none, and a big
+            # scene would otherwise send thousands of empty ones
+            row["user_text"] = dict(obj.user_text)
+        if obj.clip_plane:
+            # whether it is paused, and the views it is switched off in:
+            # "perspective", "top", "front", "right", or a detail's id
+            row["clip_plane"] = {
+                key: list(value) if isinstance(value, list) else value
+                for key, value in obj.clip_plane.items()}
+        return row
 
     # ------------------------------------------------------------------ info
 
@@ -129,7 +156,23 @@ class SerpApi:
                             if layer.parent else None),
                  "visible": layer.visible,
                  "shown": self.scene.layers.is_visible(layer.id),
+                 "locked": layer.locked,
                  "current": layer.id == self.scene.layers.current_id,
+                 # how it is drawn: widths in px on screen and mm on paper
+                 # (0 is the printer's default), and the screen width is
+                 # worked out from the print width unless pinned
+                 "linetype": layer.linetype,
+                 "print_width": layer.print_width,
+                 "screen_width": layer.lineweight,
+                 "screen_pinned": layer.screen_pinned,
+                 "hatch": {"pattern": layer.hatch,
+                           "angle": layer.hatch_angle,
+                           "spacing": layer.hatch_spacing,
+                           "color": layer.hatch_color,
+                           "background": layer.hatch_background},
+                 # the line round a cut: mm on paper, 0 for none
+                 "cut_line": {"width": layer.cut_line_width,
+                              "color": layer.cut_line_color},
                  "object_count": sum(1 for row in rows
                                      if row["layer"] == layer.name)}
                 for layer in self.scene.layers.all()
@@ -189,11 +232,15 @@ class SerpApi:
             if not ok:
                 raise ApiError(messages[-1] if messages
                                else f"Unknown command {command}")
-            for value in (inputs or []):
+            values = [",".join(str(v) for v in value)
+                      if isinstance(value, (list, tuple)) else str(value)
+                      for value in (inputs or [])]
+            answered = []
+            for text in values:
                 if not self.processor.busy:
                     break
-                text = (",".join(str(v) for v in value)
-                        if isinstance(value, (list, tuple)) else str(value))
+                answered.append(
+                    (getattr(self.processor.request, "prompt", ""), text))
                 if _is_selection_request(self.processor):
                     self._feed_selection(text)
                 else:
@@ -204,6 +251,10 @@ class SerpApi:
                 raise ApiError(
                     f"Command needs more input: '{prompt}'. "
                     f"Provide additional values in `inputs`.")
+            if len(answered) < len(values):
+                from .commands.base import unused_inputs_message
+                raise ApiError(unused_inputs_message(
+                    command, answered, values[len(answered):], messages))
         except Exception:
             # The command this call started is this call's to clean up: left
             # at its prompt, it would refuse every later external call, undo
@@ -411,7 +462,8 @@ class SerpApi:
                new_name: str | None = None, color: list | None = None,
                visible: bool | None = None,
                objects: list[str] | None = None,
-               parent: str | None = None) -> dict:
+               parent: str | None = None,
+               style: dict | None = None) -> dict:
         mgr = self.scene.layers
         if action == "list":
             return {"layers": self.scene_info()["layers"]}
@@ -438,6 +490,8 @@ class SerpApi:
             self.history.checkpoint("assign layer")
             for ref in objects or []:
                 self.scene.update(self._obj(ref).id, layer_id=layer.id)
+        elif action == "style":
+            self._style_layer(layer.id, style or {})
         elif action == "delete":
             self.history.checkpoint("delete layer")
             for o in self.scene.all():
@@ -449,6 +503,61 @@ class SerpApi:
         self.scene.notify()
         return {"ok": True}
 
+    def _style_layer(self, layer_id: str, style: dict):
+        """Set how a layer draws, as the layer page in Properties does, in
+        one undo step. A key the layer has no use for, or a value it
+        cannot draw, is refused before anything changes."""
+        from .core.layers import (HATCH_BACKGROUND_OBJECT, HATCH_INK,
+                                  hatch_background_token, hatch_color_token)
+        from .core.layout import pattern_named, section_fills_of
+        from .core.linetype import LINETYPES
+        unknown = sorted(set(style) - set(_LAYER_STYLE))
+        if unknown:
+            raise ApiError(f"Unknown layer style {', '.join(unknown)}; a "
+                           f"layer takes {', '.join(_LAYER_STYLE)}")
+        if "linetype" in style and style["linetype"] not in LINETYPES:
+            raise ApiError(f"Unknown linetype '{style['linetype']}'; "
+                           f"known: {', '.join(LINETYPES)}")
+        fills = section_fills_of(self.scene)
+        if "hatch" in style and str(style["hatch"]).lower() not in \
+                [f.lower() for f in fills]:
+            raise ApiError(f"Unknown hatch '{style['hatch']}'; "
+                           f"known: {', '.join(fills)}")
+        if "hatch_background" in style and \
+                hatch_background_token(style["hatch_background"]) == \
+                HATCH_BACKGROUND_OBJECT and \
+                str(style["hatch_background"]).lower() != \
+                HATCH_BACKGROUND_OBJECT:
+            raise ApiError("hatch_background is 'object', 'layer', "
+                           "'#rrggbb' or [r, g, b] in 0..1")
+        for key in ("hatch_color", "cut_line_color"):
+            if key in style and \
+                    hatch_color_token(style[key]) == HATCH_INK and \
+                    str(style[key]).lower() != HATCH_INK:
+                raise ApiError(f"{key} is 'ink', 'layer', '#rrggbb' or "
+                               "[r, g, b] in 0..1")
+        if "cut_line_width" in style:
+            try:
+                float(style["cut_line_width"])
+            except (TypeError, ValueError):
+                raise ApiError("cut_line_width is millimetres on the paper, "
+                               "0 for no line") from None
+        mgr = self.scene.layers
+        self.history.checkpoint("layer style")
+        # print width first: a screen width that follows it is worked
+        # out from it
+        for key in _LAYER_STYLE:
+            if key not in style:
+                continue
+            value = style[key]
+            if key == "hatch":
+                value = pattern_named(self.scene, value)
+            if key == "screen_width" and (
+                    value is None or str(value).lower() == "from print"):
+                mgr.follow_print(layer_id)
+            else:
+                getattr(mgr, _LAYER_STYLE[key])(layer_id, value)
+
     # -------------------------------------------------------------- file i/o
 
     def import_file(self, path: str, zoom_extents: bool = False) -> dict:
@@ -458,14 +567,15 @@ class SerpApi:
         if not os.path.exists(path):
             raise ApiError(f"File not found: {path}")
         self.history.checkpoint("import")
+        notes = []
         try:
-            n = fileio.import_file(self.scene, path)
+            n = fileio.import_file(self.scene, path, notes=notes)
         except Exception as exc:
             self.history.discard_checkpoint()
             raise ApiError(f"Import failed: {exc}") from exc
         if zoom_extents:
             self.viewport.zoom_extents()
-        return {"imported": n}
+        return {"imported": n, **({"notes": notes} if notes else {})}
 
     def export_file(self, path: str, selected_only: bool = False) -> dict:
         path = os.path.abspath(os.path.expanduser(path))

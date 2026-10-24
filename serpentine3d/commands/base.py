@@ -158,8 +158,49 @@ class OptionReq(Req):
 
 
 @dataclass
+class FormField:
+    """One answer a form asks for: a name to give it back under, the
+    ordinary request that asks it, and when it applies at all.
+
+    `when` is a callable over the answers given so far. A field that does
+    not apply is not asked and is not typed at: a popup greys it out, and
+    a prompt simply skips it, so a solid hatch still finishes at the
+    pattern rather than asking for a spacing that means nothing.
+    """
+    name: str
+    req: Req
+    when: object = None
+
+
+@dataclass
+class FormReq(Req):
+    """Several answers asked as one thing: a popup, where there is a window
+    to put one in, and the same prompts one after another where there is
+    not (#45).
+
+    Each field is an ordinary request, so nothing about typing, scripting,
+    the journal, replay or MCP changes: a form says how the answers belong
+    together, not that they are a new kind of answer. The command is sent
+    back a dict of {name: value}, and a window may answer the whole of it
+    at once with `CommandProcessor.provide_form`.
+
+    `preview_fn(answers)` is what the answers would make, for a popup to
+    ghost while it is open and as its answers change.
+    """
+    prompt: str = ""
+    fields: tuple = ()
+    title: str = ""
+    preview_fn: object = None
+
+
+@dataclass
 class SelectReq(Req):
     prompt: str
+    # The option a typed number sets, rather than answering the prompt:
+    # at "Select first curve (Radius=0)", 5 or 2mm means that radius and
+    # the question still stands. Rhino's prompts work this way, and a
+    # number is never the name of an object anyway.
+    number_option: str = ""
     min_count: int = 1
     max_count: int | None = None          # None = unlimited, finish with Enter
     kinds: tuple = ()                     # () = any; else e.g. ("curve",)
@@ -171,6 +212,11 @@ class SelectReq(Req):
     # trim takes the part that point is on (#31). A viewport click supplies
     # it; a typed, scripted or listed pick cannot, and leaves it out.
     want_point: bool = False
+
+
+def _is_length(text: str, units: str) -> bool:
+    from ..utils.units import parse_length
+    return parse_length(str(text), units) is not None
 
 
 def _kinds_phrase(kinds: tuple) -> str:
@@ -663,6 +709,29 @@ def format_prompt(req: Req) -> str:
     return p
 
 
+def unused_inputs_message(command: str, answered: list[tuple[str, str]],
+                          unused: list[str], messages: list[str]) -> str:
+    """The error for scripted inputs left over once their command finished.
+
+    The command's result stands by then (the export is written, the curve
+    made), so the message says which prompt each used input answered and
+    what the command did: enough to spot the mix-up and not retry blind.
+    """
+    name = (command.split() or [command])[0]
+    count = f"{len(unused)} input{'' if len(unused) == 1 else 's'}"
+    took = "; ".join(f"{prompt} = {text!r}" for prompt, text in answered)
+    did = " ".join(m for m in messages if not m.startswith("> ")).rstrip()
+    if did and did[-1] not in ".!?":
+        did += "."
+    return (f"{name} finished with {count} unused: "
+            f"{', '.join(repr(t) for t in unused)}. "
+            + (f"Its prompts took: {took}. " if took
+               else "It asked for no input. ")
+            + (f"It still ran: {did} " if did else "It still ran. ")
+            + "Send only the inputs its prompts ask for, and check what it "
+              "did before running it again.")
+
+
 # --------------------------------------------------------------- processor
 
 class CommandProcessor:
@@ -676,6 +745,11 @@ class CommandProcessor:
         self.last_command: str | None = None
         self.command_options: dict = {}
         self.headless = False            # keep FileReq as typed input
+        # The form being asked field by field, if any, with the answers
+        # given so far. A window shows it as one popup; see FormReq.
+        self.form: FormReq | None = None
+        self._form_values: dict = {}
+        self._form_index = 0
         self._start_revision = 0
         self._select_buffer: list[str] = []
         self._listeners: list = []       # notified on state change
@@ -752,8 +826,17 @@ class CommandProcessor:
             self.provide_text(arg)
         return True
 
-    def _advance(self, value):
-        if self.journal is not None and not self._journal_priming:
+    def _advance(self, value, journal: bool = True):
+        if self.form is not None:
+            # A form's fields are answered here rather than by the command,
+            # which asked for all of them at once. Each one is journalled
+            # as the answer it is, so a replay walks the same prompts.
+            if self._answer_field(value):
+                return
+            value = dict(self._form_values)
+            self._end_form()
+        elif (journal and self.journal is not None
+                and not self._journal_priming):
             self.journal.value(value, self.ctx)
         try:
             self.request = self.gen.send(value)
@@ -771,11 +854,93 @@ class CommandProcessor:
             self.ctx.echo(f"Command failed: {type(exc).__name__}: {exc}")
             self._finish(success=False)
             return
+        if isinstance(self.request, FormReq):
+            self._start_form(self.request)
         # cleared before _prepare_request: a consumed preselection advances
         # again from inside it, and that one IS an answer worth recording
         self._journal_priming = False
         self._prepare_request()
         self._notify()
+
+    # -- forms -----------------------------------------------------------
+
+    def _start_form(self, form: FormReq):
+        """Ask a form's first field. A window may answer the lot at once."""
+        self.form = form
+        self._form_values = {}
+        self._form_index = 0
+        if not self._ask_next_field():
+            values = dict(self._form_values)
+            self._end_form()
+            self._advance(values, journal=False)
+
+    def _applies(self, field) -> bool:
+        return field.when is None or bool(field.when(self._form_values))
+
+    def _ask_next_field(self) -> bool:
+        """Put the next field that applies up as the request.
+
+        False when there is none left, which is the whole form answered:
+        a field that does not apply keeps its default and is skipped.
+        Preparing the request is the caller's, since the one that starts a
+        form is on its way to doing that anyway.
+        """
+        while self._form_index < len(self.form.fields):
+            field = self.form.fields[self._form_index]
+            if self._applies(field):
+                self.request = field.req
+                return True
+            self._form_values[field.name] = getattr(field.req, "default", None)
+            self._form_index += 1
+        return False
+
+    def _answer_field(self, value) -> bool:
+        """Keep one field's answer. True while more are still to ask."""
+        field = self.form.fields[self._form_index]
+        if self.journal is not None and not self._journal_priming:
+            self.journal.value(value, self.ctx)
+        self._form_values[field.name] = value
+        self._form_index += 1
+        if not self._ask_next_field():
+            return False
+        self._prepare_request()
+        self._notify()
+        return True
+
+    def _end_form(self):
+        self.form = None
+        self._form_values = {}
+        self._form_index = 0
+
+    def provide_form(self, values: dict):
+        """Answer every field of the running form at once, as a popup does.
+
+        Fields the caller left out keep the answers already given, or the
+        field's own default, so a dialog may send back only what it shows.
+        """
+        form = self.form
+        if form is None or not self.busy:
+            return
+        answers = {}
+        for field in form.fields:
+            if field.name in values:
+                answers[field.name] = values[field.name]
+            elif field.name in self._form_values:
+                answers[field.name] = self._form_values[field.name]
+            else:
+                answers[field.name] = getattr(field.req, "default", None)
+        # Journalled as the prompts would have been, skipped fields left
+        # out, so a replay of this answers the same questions in the same
+        # order whether it was typed or clicked.
+        if self.journal is not None and not self._journal_priming:
+            seen = {}
+            for field in form.fields:
+                if field.when is not None and not field.when(seen):
+                    continue
+                seen[field.name] = answers[field.name]
+                self.journal.value(answers[field.name], self.ctx)
+        self._end_form()
+        self._advance(answers, journal=False)
 
     def _prepare_request(self):
         req = self.request
@@ -840,6 +1005,7 @@ class CommandProcessor:
         self.gen = None
         self.request = None
         self.active = None
+        self._end_form()
         made = [i for i in self.ctx.result_ids if i in self.ctx.scene.objects]
         held = [e for e in self.ctx.result_subobjects
                 if e[0] in self.ctx.scene.objects]
@@ -886,10 +1052,10 @@ class CommandProcessor:
         if not self.busy or self.request is None:
             return
         if isinstance(self.request, PointReq):
-            self.ctx.last_point = value
             # Enter answers with None and an option answers with its name;
             # neither is somewhere you can snap to
             if value is not None and not isinstance(value, str):
+                self.ctx.last_point = value
                 try:
                     self.picked_points.append(
                         tuple(float(c) for c in value)[:3])
@@ -904,11 +1070,19 @@ class CommandProcessor:
             return False
         for opt_name, values in req.choices.items():
             if opt_name.lower() == name.lower():
+                if value is None and not values:
+                    return False         # nothing to cycle through
                 if value is None:            # cycle
                     cur = self.command_options.get(opt_name, values[0])
                     idx = (values.index(cur) + 1) % len(values) \
                         if cur in values else 0
                     value = values[idx]
+                elif (getattr(req, "number_option", "") == opt_name
+                        and _is_length(value, self.ctx.scene.units)):
+                    # The prompt's own number: a radius is whatever was
+                    # typed, not one of a few listed answers. What the
+                    # option lists is only what it opens on.
+                    value = value.strip()
                 else:
                     matches = [v for v in values
                                if v.lower().startswith(value.lower())]
@@ -925,6 +1099,21 @@ class CommandProcessor:
                 self._notify()
                 return True
         return False
+
+    def _number_option(self, text: str) -> bool:
+        """A number typed at a prompt that has one is that option's value.
+
+        "5" at "Select first curve (Radius=0)" is a radius of five, and
+        the prompt stands until a curve is picked: the option is what the
+        number was for, and an object is never called 5.
+        """
+        req = self.request
+        name = getattr(req, "number_option", "")
+        if not name:
+            return False
+        if not _is_length(text, self.ctx.scene.units):
+            return False
+        return self.set_option(name, text.strip())
 
     def _try_option_text(self, text: str) -> bool:
         req = self.request
@@ -983,6 +1172,8 @@ class CommandProcessor:
         # names, paths and other literal text answers keep the character.
         if text.lstrip().startswith("!") and not isinstance(self.request, TextReq):
             self.run(text)
+            return
+        if text.strip() and self._number_option(text):
             return
         if text.strip() and self._try_option_text(text):
             return
@@ -1137,7 +1328,7 @@ class CommandProcessor:
         req = self.request
         if req is None or not getattr(req, "choices", None):
             return []
-        return [(n, self.command_options.get(n, v[0]))
+        return [(n, self.command_options.get(n, v[0] if v else ""))
                 for n, v in req.choices.items()]
 
     def prompt_text(self) -> str:

@@ -15,7 +15,10 @@ import numpy as np
 
 from . import geometry
 from .deferred import DeferredShape
-from .layers import DEFAULT_LAYER_ID, LayerManager
+from .layers import (DEFAULT_CUT_LINE_WIDTH, DEFAULT_LAYER_ID,
+                     HATCH_BACKGROUND_OBJECT, HATCH_INK, LayerManager,
+                     hatch_token_rgb, screen_width_for)
+from .layout import SectionFill
 from .tessellate import DisplayMesh, tessellate
 
 
@@ -76,7 +79,14 @@ class SceneObject:
     clip_plane: dict | None = None     # {"enabled": bool}: sections the view
     annotation: dict | None = None     # {"text": str}: model-space dot label
     linetype: str = "ByLayer"          # dash style; ByLayer -> use the layer's
+    print_width: float | None = None   # plotted mm; None -> the layer's
+    # its own section hatch, {"pattern", "angle", "spacing", "color"} as
+    # layers.section_fill_dict makes it; None -> the layer's
+    section_fill: dict | None = None
     draw_order: int = 0                # higher draws on top (breaks depth ties)
+    # {key: value}, Rhino's Attribute User Text, kept by its rules: see
+    # core/user_text.py, and never edit it in place
+    user_text: dict | None = None
     _mesh: DisplayMesh | None = field(default=None, repr=False, compare=False)
     _bounds: tuple | None = field(default=None, repr=False, compare=False)
     # The scene holding this object, so a bare `.shape` read on something
@@ -187,9 +197,14 @@ class Scene:
         # drawing, not about the pane you happened to ask in.
         self.dir_enabled: set[str] = set()
         self.layouts: list = []         # drafting sheets (core/layout.py)
+        self.sheet_groups: list = []    # SheetGroups the sheets sit in
         self.units: str = "mm"          # document units (utils/units.py)
         self.block_defs: dict = {}      # id -> {"name", "shapes": [TopoDS]}
         self.annot_styles: dict = {}    # name -> text/dim style overrides
+        # name -> HatchPattern, the patterns loaded from .pat files (#92)
+        self.hatch_patterns: dict = {}
+        # the names the last load gave, a fresh list each time; not saved
+        self.loaded_patterns: list = []
         self.record_history = False     # new surfaces remember their inputs
         self.history_records: list = []   # {"op", "inputs", "output", ...}
         self._regen_active = False
@@ -294,7 +309,7 @@ class Scene:
 
     def add_from(self, shape, like: SceneObject) -> SceneObject:
         """Add a shape carrying over another object's display attributes
-        (layer, colour, material, annotation, group)."""
+        (layer, colour, material, annotation, group) and its user text."""
         obj = self.add(shape, layer_id=like.layer_id)
         fields = {}
         if like.color is not None:
@@ -305,6 +320,12 @@ class Scene:
             fields["annotation"] = dict(like.annotation)
         if like.group_id:
             fields["group_id"] = like.group_id
+        if like.print_width is not None:
+            fields["print_width"] = like.print_width
+        if like.section_fill:
+            fields["section_fill"] = dict(like.section_fill)
+        if like.user_text:
+            fields["user_text"] = dict(like.user_text)
         if fields:
             obj = self.update(obj.id, **fields)
         return obj
@@ -344,7 +365,9 @@ class Scene:
         # The file's word on the kind was a guess made without the geometry.
         obj.kind = geometry.shape_kind(shapes[0])
         for extra in shapes[1:]:
-            self.add(extra, layer_id=obj.layer_id)
+            # with the original's colour and user text, as eager import
+            # gives both pieces the one object's attributes
+            self.add_from(extra, obj)
         self.notify("objects")
         return obj
 
@@ -457,6 +480,11 @@ class Scene:
                 self.update(obj_id, **fields)
         return len(ids)
 
+    def get_layout(self, layout_id: str):
+        """The sheet with this id, or None."""
+        return next((lay for lay in self.layouts if lay.id == layout_id),
+                    None)
+
     def get(self, obj_id: str) -> SceneObject | None:
         return self.objects.get(obj_id)
 
@@ -503,19 +531,92 @@ class Scene:
     def print_width_of(self, obj: SceneObject) -> float:
         """The pen width, in mm, a plot draws this object with.
 
-        Taken off the layer: an object plots at its layer's print width, and
-        0 means the device default, the same as Rhino's PlotWeight.
+        An object's own width if it has one, or else its layer's; 0 means
+        the device default, the same as Rhino's PlotWeight.
         """
+        if obj.print_width is not None:
+            return obj.print_width
         return self.layers.get(obj.layer_id).print_width
 
+    def screen_width_of(self, obj: SceneObject) -> float:
+        """The width an object's edges draw at on screen, in pixels.
+
+        An object with a print width of its own draws at that width the
+        way its layer would, unless the layer's screen width was set by
+        hand: then that holds for everything on the layer.
+        """
+        layer = self.layers.get(obj.layer_id)
+        if obj.print_width is None or layer.screen_pinned:
+            return layer.lineweight
+        return screen_width_for(obj.print_width)
+
     def hatch_of(self, obj: SceneObject) -> str:
-        """The fill a cut through this object is drawn with, or nothing.
+        """The fill a cut through this object is drawn with ("none": none):
+        its own section hatch's, or else its layer's.
 
         Taken off the layer, the way the print width is: what a thing is
         made of belongs to the layer it is on, so a section through it
         reads as concrete or as steel without anybody hatching it by hand.
+        One object can still be made of something else.
         """
+        if obj.section_fill:
+            return obj.section_fill["pattern"]
         return self.layers.get(obj.layer_id).hatch
+
+    def section_fill_of(self, obj: SceneObject):
+        """Everything a cut through this object is drawn with: the
+        pattern, its angle and spacing on the paper, and its colour, then
+        the width and colour of the line round it. A style of its own is
+        all of a piece, cut line and all, the way Rhino's is."""
+        layer = self.layers.get(obj.layer_id)
+        own = obj.section_fill
+        if own:
+            return SectionFill(
+                own["pattern"], own["angle"], own["spacing"],
+                hatch_token_rgb(own["color"], layer.color),
+                own.get("cut_line_width", DEFAULT_CUT_LINE_WIDTH),
+                hatch_token_rgb(own.get("cut_line_color", HATCH_INK),
+                                layer.color),
+                self.hatch_pattern(own["pattern"]),
+                hatch_token_rgb(own.get("background",
+                                        HATCH_BACKGROUND_OBJECT),
+                                layer.color))
+        return SectionFill(layer.hatch, layer.hatch_angle,
+                           layer.hatch_spacing,
+                           self.layers.hatch_rgb(layer.id),
+                           layer.cut_line_width,
+                           hatch_token_rgb(layer.cut_line_color, layer.color),
+                           self.hatch_pattern(layer.hatch),
+                           hatch_token_rgb(layer.hatch_background,
+                                           layer.color))
+
+    def hatch_pattern(self, name):
+        """The families a fill's name is drawn from in this drawing: one
+        of the app's patterns or one loaded from a file, or None for Lines,
+        Cross and Solid, which draw themselves, and for a name it has no
+        pattern by, which draws as lines."""
+        from .hatch_patterns import definition_for
+        return definition_for(self.hatch_patterns, name)
+
+    def hatch_pattern_users(self, name) -> dict:
+        """How many of each thing in the drawing name a pattern: layers,
+        objects with a section style of their own, hatches on sheets and
+        hatches in the model, by those four keys."""
+        key = str(name or "").lower()
+        hatches = objects = 0
+        for obj in self.objects.values():
+            if obj.kind == "hatch" and \
+                    str(getattr(obj.shape, "pattern", "")).lower() == key:
+                hatches += 1
+            own = obj.section_fill
+            if own and str(own.get("pattern", "")).lower() == key:
+                objects += 1
+        return {"layer": sum(1 for la in self.layers.all()
+                             if la.hatch.lower() == key),
+                "object": objects,
+                "sheet": sum(1 for lay in self.layouts for h in lay.hatches
+                             if str(h.pattern).lower() == key),
+                "hatch": hatches}
 
     def render_color_of(self, obj: SceneObject) -> tuple[float, float, float]:
         """The colour rendered mode draws the object's surfaces in.
@@ -537,8 +638,10 @@ class Scene:
         self.layers.on_shown = self.realise_layer
         self.named_views = {}
         self.layouts = []
+        self.sheet_groups = []
         self.block_defs = {}
         self.annot_styles = {}
+        self.hatch_patterns = {}
         self.image_planes = []
         self.history_records = []
         self.trajectories = []
@@ -569,8 +672,10 @@ class Scene:
             "layers": self.layers.snapshot(),
             "named_views": copy.deepcopy(self.named_views),
             "layouts": [lay.clone() for lay in self.layouts],
+            "sheet_groups": copy.deepcopy(self.sheet_groups),
             "block_defs": {k: dict(v) for k, v in self.block_defs.items()},
             "annot_styles": {k: dict(v) for k, v in self.annot_styles.items()},
+            "hatch_patterns": dict(self.hatch_patterns),
             "image_planes": copy.deepcopy(self.image_planes),
             "history_records": copy.deepcopy(self.history_records),
             # By reference, not deep-copied: a trajectory is tens of
@@ -589,10 +694,12 @@ class Scene:
         self.layers.restore(snap["layers"])
         self.named_views = copy.deepcopy(snap.get("named_views", {}))
         self.layouts = [lay.clone() for lay in snap.get("layouts", [])]
+        self.sheet_groups = copy.deepcopy(snap.get("sheet_groups", []))
         self.block_defs = {k: dict(v) for k, v in
                            snap.get("block_defs", {}).items()}
         self.annot_styles = {k: dict(v) for k, v in
                              snap.get("annot_styles", {}).items()}
+        self.hatch_patterns = dict(snap.get("hatch_patterns", {}))
         if not any(obj.kind == "picture" for obj in self.all()):
             self.image_planes = copy.deepcopy(snap.get("image_planes", []))
         self.history_records = copy.deepcopy(

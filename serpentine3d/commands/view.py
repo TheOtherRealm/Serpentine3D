@@ -1,5 +1,6 @@
 """View and display commands (non-mutating)."""
 
+from ..core import clipping as _clipping
 from ..core import geometry as g
 from .base import (
     FileReq, OptionReq, PointReq, SelectReq, TextReq, command, frame_sides,
@@ -166,10 +167,11 @@ def cmd_viewcapturetoclipboard(ctx):
 @command("clippingplane", aliases=("clip",))
 def cmd_clippingplane(ctx):
     """Place a rectangular clipping plane parallel to the CPlane through
-    the first corner: geometry on its normal side is hidden in shaded
-    viewports. Move or rotate the plane
-    object to move the cut; Flip reverses the kept side. The purple arrow
-    points toward the visible side, following Rhino's convention."""
+    the first corner. It cuts away the side toward the view it is drawn
+    in, as Rhino 8 does: drawn in Top it takes what is above and keeps what
+    is below, the way you are looking. Move or rotate the plane object to
+    move the cut; Flip reverses the kept side. The purple arrow points
+    toward the visible side, following Rhino's convention."""
     c1 = yield PointReq("First corner of clipping plane")
 
     def _rect(p):
@@ -189,12 +191,43 @@ def cmd_clippingplane(ctx):
     if face is None:
         ctx.echo("Degenerate rectangle — no clipping plane created.")
         return
+    # The side to cut away is the viewer's. The rectangle's own winding,
+    # which follows the way it was dragged, used to decide it, so one drag
+    # cut down and the next cut up.
+    away = _toward_viewer(ctx, c1, ctx.cplane.normal)
     if ctx.opt("Flip", "No") == "Yes":
+        away = [-c for c in away]
+    normal = g.face_normal(next(iter(g.faces_of(face))))
+    if sum(a * b for a, b in zip(normal, away)) < 0:
         face = g.mirror(face, tuple(c1), tuple(ctx.cplane.normal))
     obj = ctx.scene.add(face, name=_next_clip_name(ctx.scene))
     ctx.scene.update(obj.id, clip_plane={"enabled": True})
     ctx.echo(f"Created {obj.name}. The purple arrow points toward the visible "
              "side. 'disableclippingplane' pauses it.")
+
+
+def _toward_viewer(ctx, point, normal) -> list:
+    """The one of `normal` and its reverse that faces whoever is drawing.
+
+    A parallel view (Top, Front) is looked at along its direction wherever
+    its eye happens to sit, so a plane drawn above that eye is still seen
+    from above; a perspective view is looked at from its eye. With no view
+    at all, a script's, the construction plane's normal stands, and that
+    faces the viewer in every standard view.
+    """
+    n = [float(c) for c in normal]
+    cam = getattr(getattr(ctx, "viewport", None), "camera", None)
+    if cam is None:
+        return n
+    eye = [float(c) for c in cam.position]
+    if getattr(cam, "projection", "perspective") == "parallel":
+        target = [float(c) for c in cam.target]
+        toward = [e - t for e, t in zip(eye, target)]
+    else:
+        toward = [e - float(p) for e, p in zip(eye, point)]
+    if sum(a * b for a, b in zip(n, toward)) < 0:
+        return [-c for c in n]
+    return n
 
 
 def _next_clip_name(scene) -> str:
@@ -212,23 +245,81 @@ def _clip_planes_from(ctx, objs):
 @command("disableclippingplane", aliases=("dcc",), mutates=False)
 def cmd_disableclippingplane(ctx):
     """Pause clipping planes (they stay in the scene, the cut stops)."""
+    # min_count=0: Enter on nothing is every plane, as the prompt says,
+    # rather than the command cancelled
     objs = yield SelectReq("Select clipping planes (Enter or 'all' = all)",
-                           allow_preselected=True)
+                           allow_preselected=True, min_count=0)
     planes = _clip_planes_from(ctx, objs)
     for o in planes:
-        ctx.scene.update(o.id, clip_plane={"enabled": False})
+        # the views it is switched off in wait for it to resume
+        ctx.scene.update(o.id, clip_plane={**o.clip_plane, "enabled": False})
     ctx.echo(f"Disabled {len(planes)} clipping plane(s).")
 
 
 @command("enableclippingplane", aliases=("ecc",), mutates=False)
 def cmd_enableclippingplane(ctx):
     """Re-enable paused clipping planes."""
+    # min_count=0: Enter on nothing is every plane, as the prompt says,
+    # rather than the command cancelled
     objs = yield SelectReq("Select clipping planes (Enter or 'all' = all)",
-                           allow_preselected=True)
+                           allow_preselected=True, min_count=0)
     planes = _clip_planes_from(ctx, objs)
     for o in planes:
-        ctx.scene.update(o.id, clip_plane={"enabled": True})
+        ctx.scene.update(o.id, clip_plane={**o.clip_plane, "enabled": True})
     ctx.echo(f"Enabled {len(planes)} clipping plane(s).")
+
+
+def _view_here(ctx):
+    """The view a clipping plane is switched in from where you are: the
+    pane, or the detail you are inside on a sheet. None says why not."""
+    vp = getattr(ctx, "viewport", None)
+    view = vp.clip_view() if vp is not None else None
+    if view is None:
+        ctx.echo("No view to switch it in here: run this in a model "
+                 "view, or double-click a detail to go inside it first.")
+    return view
+
+
+@command("disableclippinginview", aliases=("dcv",), mutates=False)
+def cmd_disableclippinginview(ctx):
+    """Switch clipping planes off in the view you are in (the pane, or the
+    detail you are inside) and leave them cutting every other view."""
+    view = _view_here(ctx)
+    if view is None:
+        return
+    objs = yield SelectReq("Clipping planes to switch off in this view "
+                           "(Enter or 'all' = all)", allow_preselected=True,
+                           min_count=0)
+    planes = _clip_planes_from(ctx, objs)
+    for o in planes:
+        _clipping.switch(ctx.scene, o.id, view, False)
+    ctx.echo(f"{len(planes)} clipping plane(s) no longer cut this view; "
+             "'enableclippinginview' brings them back.")
+
+
+@command("enableclippinginview", aliases=("ecv",), mutates=False)
+def cmd_enableclippinginview(ctx):
+    """Switch clipping planes back on in the view you are in (the pane, or
+    the detail you are inside). A paused one resumes, and so cuts its
+    other views again as well."""
+    view = _view_here(ctx)
+    if view is None:
+        return
+    objs = yield SelectReq("Clipping planes to switch on in this view "
+                           "(Enter or 'all' = all)", allow_preselected=True,
+                           min_count=0)
+    planes = _clip_planes_from(ctx, objs)
+    resumed = 0
+    for o in planes:
+        if not o.clip_plane.get("enabled"):
+            resumed += 1
+            ctx.scene.update(o.id, clip_plane={**o.clip_plane,
+                                               "enabled": True})
+        _clipping.switch(ctx.scene, o.id, view, True)
+    ctx.echo(f"{len(planes)} clipping plane(s) cut this view.")
+    if resumed:
+        ctx.echo(f"{resumed} of them had been paused everywhere, so they "
+                 "cut their other views again too.")
 
 
 @command("selclippingplane", mutates=False)
@@ -573,12 +664,17 @@ def cmd_units(ctx):
         rescale = yield OptionReq(
             f"Scale model by {factor:g} so objects keep their real size?",
             options=["Yes", "No"], default="Yes")
+    # Before anything changes, so that one undo puts the units back with the
+    # model and the sheets. Taken after the units had changed, undo left the
+    # new units on the old model; and without a rescale there was none.
+    ctx.history.checkpoint("units")
     ctx.scene.units = choice
     if rescale == "Yes":
-        ctx.history.checkpoint("units rescale")
         for o in ctx.scene.all():
             ctx.scene.replace_shape(
                 o.id, g.scale(o.shape, (0, 0, 0), factor))
+    for lay in ctx.scene.layouts:
+        lay.convert_units(factor, rescaled=rescale == "Yes")
     ctx.scene.notify()
     ctx.echo(f"Document units: {UNIT_LABELS[choice]}."
              + (" Model rescaled." if rescale == "Yes" else ""))

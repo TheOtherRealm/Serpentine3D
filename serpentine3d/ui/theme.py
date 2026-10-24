@@ -8,6 +8,10 @@ GRID_MAJOR = (1.0, 1.0, 1.0, 0.11)
 GRID_AXIS_X = (0.75, 0.33, 0.32, 0.85)
 GRID_AXIS_Y = (0.38, 0.65, 0.36, 0.85)
 SELECTION_COLOR = (1.0, 0.78, 0.25)          # warm gold
+# The selection while Properties shows something else, a picked layer say:
+# still selected, still gold, but about half way back towards the background,
+# so full gold keeps meaning "this is what Properties is editing".
+HELD_SELECTION_COLOR = (0.62, 0.50, 0.22)
 ACCENT = "#d9a441"
 
 # Control points, when they are on. Cool, because everything else in the
@@ -46,6 +50,13 @@ ACCENT_DIM = "#8a6a2f"
 # code, and Qt's own disabled grey is not what this window paints.
 TEXT_MUTED = "#9a9b9e"
 
+# Panel spacing, shared so Properties and Layers line up with each other and
+# with the layers mockup they were drawn from: a page stands this far in from
+# its sides, and a list row is this tall.
+PANEL_INSET = 10
+LIST_ROW_HEIGHT = 28
+SEAM = "#1b1c1f"               # the dark line between two parts of a panel
+
 # Shaded-mode lighting. SHADED_AMBIENT mirrors a constant hardcoded in
 # viewport.MESH_FRAG (`uColor * (0.30 + 0.70 * diff)`); a test pins the two
 # together. FILL_FLOOR is what a pure black object is shaded as, and colours
@@ -78,6 +89,47 @@ def shaded_fill(color):
         return (r, g, b)
     lift = FILL_FLOOR * (1.0 - v / FILL_KNEE)
     return (min(1.0, r + lift), min(1.0, g + lift), min(1.0, b + lift))
+
+
+# Fixed-pitch faces to name in a style sheet where the "monospace" alias names
+# nothing, each platform's own coding font first.
+MONO_FAMILIES = ("Menlo", "SF Mono", "Consolas", "Cascadia Mono",
+                 "DejaVu Sans Mono", "Liberation Mono", "Courier New")
+
+
+def _monospace_alias():
+    """The installed family the "monospace" alias comes to, or None.
+
+    Linux has fontconfig's alias, which someone may have pointed at a face
+    of their own. Windows has no font by that name, and Qt's stand-in there
+    is the proportional default, so it counts only when it is fixed pitch.
+    """
+    from PySide6.QtGui import QFont, QFontDatabase, QFontInfo
+    asked = QFont("monospace")
+    asked.setStyleHint(QFont.StyleHint.Monospace)
+    found = QFontInfo(asked)
+    if found.fixedPitch() and QFontDatabase.hasFamily(found.family()):
+        return found.family()
+    return None
+
+
+def mono_family() -> str:
+    """An installed fixed-pitch family, for a style sheet's font-family.
+
+    A style sheet that says `font-family: monospace` drew in the proportional
+    default on Windows: the alias names nothing there, and a style sheet
+    carries no style hint for Qt to fall back on. A family that is really
+    installed is matched exactly everywhere.
+    """
+    from PySide6.QtGui import QFontDatabase
+    alias = _monospace_alias()
+    if alias:
+        return alias
+    for family in MONO_FAMILIES:
+        if (QFontDatabase.hasFamily(family)
+                and QFontDatabase.isFixedPitch(family)):
+            return family
+    return "monospace"
 
 QSS = """
 * { outline: none; }
@@ -155,10 +207,12 @@ QListWidget, QTreeWidget, QTableWidget, QTreeView {
 QListWidget::item, QTreeWidget::item {
     padding: 3px;
 }
-QListWidget::item:selected, QTreeWidget::item:selected {
+QListWidget::item:selected, QTreeWidget::item:selected,
+QTableWidget::item:selected {
     background: #4a3f28;
     color: #f0d9a8;
 }
+QTableWidget QLineEdit { padding: 0 6px; border-radius: 0; }
 QHeaderView::section {
     background: #2e2f34;
     border: none;
@@ -177,6 +231,29 @@ QPushButton {
 QPushButton:hover { background: #3f4047; border-color: #55565e; }
 QPushButton:pressed { background: #2b2c30; }
 QPushButton:default { border-color: #d9a441; }
+
+/* Styled here so a slider looks the same everywhere: left to the platform,
+   macOS drew no track on this dark theme and Linux filled it with the
+   desktop's highlight colour instead of ours. */
+QSlider::groove:horizontal {
+    height: 4px;
+    background: #1e1f22;
+    border: 1px solid #3a3b41;
+    border-radius: 3px;
+}
+QSlider::sub-page:horizontal {
+    background: #8a6a2f;
+    border: 1px solid #8a6a2f;
+    border-radius: 3px;
+}
+QSlider::handle:horizontal {
+    background: #cfd0d2;
+    border: 1px solid #45464d;
+    width: 14px;
+    margin: -5px 0;
+    border-radius: 8px;
+}
+QSlider::handle:horizontal:hover { background: #e6e7e9; border-color: #d9a441; }
 
 QMenuBar { background: #2b2c30; }
 QMenuBar::item { padding: 5px 10px; background: transparent; }
@@ -226,6 +303,12 @@ QLabel#commandPrompt {
     color: #d9a441;
     font-weight: bold;
 }
+QPushButton[link="true"] {
+    background: transparent; border: none; padding: 2px 0; min-height: 0;
+    color: #d9a441; text-align: left;
+}
+QPushButton[link="true"]:hover { color: #f0d9a8; text-decoration: underline; }
+QPushButton[link="true"]:disabled { color: #8a6a2f; }
 QLabel#commandEcho {
     color: #85868a;
     font-family: monospace;
@@ -242,3 +325,25 @@ QCheckBox::indicator:checked {
     border-color: #d9a441;
 }
 """
+
+
+def apply_interface_font(app, family: str) -> None:
+    """The interface font onto the whole app ("" = system default).
+
+    Live-safe: widgets repolish on the font-change event. The kind line
+    sets its own fixed-pitch font and keeps it — tests say so.
+    """
+    from PySide6.QtGui import QFont
+    app.setFont(QFont(family))
+
+
+def apply_saved_interface_font(app) -> None:
+    """The saved interface font (Settings → Display) onto the app.
+
+    Called at startup, before any window is built, so everything inherits
+    it from the beginning.
+    """
+    from ..utils.config import Config
+    family = Config().get("display", "interface_font", default="") or ""
+    if family:
+        apply_interface_font(app, family)

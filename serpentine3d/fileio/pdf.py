@@ -7,7 +7,7 @@ shaded details are rendered to an image via an offscreen framebuffer.
 from __future__ import annotations
 
 import numpy as np
-from PySide6.QtCore import QPointF, QSizeF, Qt
+from PySide6.QtCore import QMarginsF, QPointF, QSizeF, Qt
 from PySide6.QtGui import (
     QColor, QFont, QPageLayout, QPageSize, QPainter, QPdfWriter, QPen,
     QPolygonF,
@@ -26,23 +26,39 @@ def export_layouts_pdf(window, layouts: list, path: str):
         raise ValueError("No layouts to export")
     writer = QPdfWriter(path)
     writer.setResolution(600)
-    first = layouts[0]
-    writer.setPageSize(QPageSize(QSizeF(first.paper_w, first.paper_h),
-                                 QPageSize.Unit.Millimeter, name="",
-                                 matchPolicy=QPageSize.SizeMatchPolicy.ExactMatch))
-    painter = QPainter(writer)
+    paint_layouts(writer, window, layouts)
+
+
+def page_layout(layout) -> QPageLayout:
+    """A sheet's page: its paper, landscape or portrait, no margins (the
+    sheet draws its own). A standard size is named as one, so a printer is
+    asked for A3 turned on its side rather than for a 420 x 297 custom."""
+    w, h = layout.paper_w, layout.paper_h
+    turn = (QPageLayout.Orientation.Landscape if w > h
+            else QPageLayout.Orientation.Portrait)
+    size = QPageSize(QSizeF(min(w, h), max(w, h)),
+                     QPageSize.Unit.Millimeter, name="",
+                     matchPolicy=QPageSize.SizeMatchPolicy.FuzzyMatch)
+    return QPageLayout(size, turn, QMarginsF(0, 0, 0, 0),
+                       QPageLayout.Unit.Millimeter)
+
+
+def paint_layouts(device, window, layouts: list) -> int:
+    """Paint sheets onto a paged device, a page each, each page laid out
+    for its own sheet: a PDF writer, or a printer. Returns the pages."""
+    if not layouts:
+        return 0
+    device.setPageLayout(page_layout(layouts[0]))
+    painter = QPainter(device)
     try:
         for i, lay in enumerate(layouts):
             if i > 0:
-                writer.setPageSize(QPageSize(
-                    QSizeF(lay.paper_w, lay.paper_h),
-                    QPageSize.Unit.Millimeter, name="",
-                    matchPolicy=QPageSize.SizeMatchPolicy.ExactMatch))
-                writer.newPage()
-            _paint_layout(painter, window, lay,
-                          writer.resolution() / 25.4)
+                device.setPageLayout(page_layout(lay))
+                device.newPage()
+            _paint_layout(painter, window, lay, device.resolution() / 25.4)
     finally:
         painter.end()
+    return len(layouts)
 
 
 def _paint_layout(painter: QPainter, window, layout, k: float):
@@ -70,7 +86,8 @@ def _paint_layout(painter: QPainter, window, layout, k: float):
             font.setPixelSize(int(2.6 * k))
             painter.setFont(font)
             lx, ly = pt(detail.x + 1.5, detail.y + 1.5)
-            painter.drawText(int(lx), int(ly), detail.scale_text())
+            painter.drawText(int(lx), int(ly),
+                             detail.scale_text(window.scene.units))
 
     _paint_paper_objects(painter, layout, k, pt)
 
@@ -155,26 +172,39 @@ def _paint_detail_vector(painter, layout_view, detail, layout, k):
     if regions:
         # The same answer the screen draws, so a bore that is open on
         # screen is open on paper.
-        from ..core.layout import cut_hatching, cut_patterns
+        from ..core.layout import SectionFill, cut_patterns, section_drawing
         from PySide6.QtCore import QPointF
         from PySide6.QtGui import QPolygonF
-        fill, loops, solid = cut_hatching(regions, cx, cy, s,
-                                          patterns=cut_patterns(data))
-        painter.setPen(QPen(QColor(60, 62, 70), 0.15 * k))
-        for a, b in fill:
-            painter.drawLine(
-                QPointF(a[0] * k, (layout.paper_h - a[1]) * k),
-                QPointF(b[0] * k, (layout.paper_h - b[1]) * k))
-        painter.setPen(QPen(QColor(10, 10, 12), 0.5 * k))
-        for loop in loops:
-            ring = list(loop) + [loop[0]]     # closed, or one side is missing
-            painter.drawPolyline(QPolygonF(
-                [QPointF(x * k, (layout.paper_h - y) * k) for x, y in ring]))
-        # Over the outline, the way the hatching goes over it: what is
-        # poched on a section is drawn behind its own edges.
+        region_fills = getattr(layout_view, "_region_fills", None)
+        fills = (region_fills(data) if region_fills is not None
+                 else [SectionFill(p or "lines") for p in cut_patterns(data)])
+        lines, outlines, floods = section_drawing(regions, cx, cy, s, fills)
+        # Under the hatching and the outline: what is poched on a section
+        # is drawn behind its own edges, a colour is opaque, and a face's
+        # background (#91) is the ground its hatch lies on.
         from ..ui import annot_paint
-        annot_paint.fill_cut_solid(
-            painter, lambda x, y: (x * k, (layout.paper_h - y) * k), solid)
+        for color, rings in floods:
+            annot_paint.fill_cut_solid(
+                painter, lambda x, y: (x * k, (layout.paper_h - y) * k),
+                [rings], color)
+        for color, segs in lines:
+            painter.setPen(QPen(QColor(60, 62, 70) if color is None
+                                else QColor.fromRgbF(*color[:3]), 0.15 * k))
+            for a, b in segs:
+                painter.drawLine(
+                    QPointF(a[0] * k, (layout.paper_h - a[1]) * k),
+                    QPointF(b[0] * k, (layout.paper_h - b[1]) * k))
+        # Each face's cut line at its own width on the paper, in ink unless
+        # its section says a colour (#82).
+        for color, width_mm, rings in outlines:
+            painter.setPen(QPen(QColor(10, 10, 12) if color is None
+                                else QColor.fromRgbF(*color[:3]),
+                                width_mm * k))
+            for loop in rings:
+                ring = list(loop) + [loop[0]]  # closed, or a side is missing
+                painter.drawPolyline(QPolygonF(
+                    [QPointF(x * k, (layout.paper_h - y) * k)
+                     for x, y in ring]))
     painter.restore()
 
 
