@@ -85,7 +85,7 @@ def read_thumbnail(path: str) -> bytes | None:
 
 
 def save_scene(scene, path: str, thumbnail: bytes | None = None):
-    from ..core.layout import layouts_to_json, sheet_groups_to_json
+    from ..core.layout import layouts_to_json, sheet_groups_to_json, style_set
     clouds = [o for o in scene.all() if o.kind == "pointcloud"]
     trajectories = list(getattr(scene, "trajectories", None) or [])
     session = getattr(scene, "session", None) or None
@@ -114,7 +114,14 @@ def save_scene(scene, path: str, thumbnail: bytes | None = None):
         "layouts": layouts_to_json(scene.layouts),
         "sheet_groups": sheet_groups_to_json(scene.sheet_groups),
         "annot_styles": {k: dict(v) for k, v in scene.annot_styles.items()},
-        "hatch_patterns": [p.to_dict() for p in scene.hatch_patterns.values()],
+        # which built-in styles its lettering is in, so it keeps their sizes
+        "annot_style_set": style_set(scene),
+        # whether its text heights are capital heights, or font sizes
+        "text_height_measures": scene.text_height_measures,
+        # that a clipping plane it hides still cuts, which before this one
+        # hidden did not
+        "hidden_planes_cut": True,
+        "hatch_patterns": [p.to_dict() for p in _patterns_used(scene)],
         "history_records": scene.history_records,
         "layers": [
             {
@@ -157,6 +164,8 @@ def save_scene(scene, path: str, thumbnail: bytes | None = None):
                 "print_width": obj.print_width,
                 "section_fill": (dict(obj.section_fill)
                                  if obj.section_fill else None),
+                "hatch_style": (dict(obj.hatch_style)
+                                if obj.hatch_style else None),
                 "user_text": (dict(obj.user_text) if obj.user_text
                               else None),
                 "group": obj.group_id,
@@ -216,13 +225,43 @@ def save_scene(scene, path: str, thumbnail: bytes | None = None):
         doc["requires"] = "0.12.2"
     # A release that knows only Lines, Cross and Solid refuses a model
     # hatch drawn with any other pattern, and the whole file with it
-    # (#92). A layer naming one is only drawn with lines there.
+    # (#92). Other hatching it opens and keeps only as far as it knows it,
+    # so a save there loses the rest for good, and that asks too.
     from ..core.hatch_patterns import is_legacy
-    if any(isinstance(shape, HatchShape) and not is_legacy(shape.pattern)
-           for shape in new_shapes):
+    if (any(isinstance(shape, HatchShape) and not is_legacy(shape.pattern)
+            for shape in new_shapes)
+            or doc["hatch_patterns"] or _hatching_0121_loses(scene)):
         doc["version"] = 8
         doc["requires"] = "0.12.2"
     _write_container(doc, path, thumbnail, blobs)
+
+
+def _hatching_0121_loses(scene) -> bool:
+    """Whether 0.12.1 would open this drawing and let some of its hatching
+    go without a word: a hatch's own colour or background, a cut's
+    background (#91), or a cut in any pattern but none, Lines, Cross and
+    Solid, which it fills with lines. The patterns a drawing carries go
+    the same way, and are asked about where they are written."""
+    from ..core.hatch_patterns import is_legacy
+    from ..core.layers import HATCH_BACKGROUND_NONE
+
+    def kept(pattern) -> bool:
+        name = str(pattern or "").strip().lower()
+        return name in ("", "none") or is_legacy(name)
+
+    for layer in scene.layers.all():
+        if (layer.hatch_background != HATCH_BACKGROUND_NONE
+                or not kept(layer.hatch)):
+            return True
+    for obj in scene.all():
+        if any((obj.hatch_style or {}).values()):
+            return True
+        fill = obj.section_fill
+        if fill and (fill.get("background", HATCH_BACKGROUND_NONE)
+                     != HATCH_BACKGROUND_NONE
+                     or not kept(fill.get("pattern"))):
+            return True
+    return False
 
 
 def _carries_an_origin(shape) -> bool:
@@ -336,7 +375,8 @@ def load_scene(scene, path: str):
 
 _CARRIED_FIELDS = ("visible", "locked", "group_id", "block_id", "color",
                    "material", "clip_plane", "annotation", "linetype",
-                   "draw_order", "print_width", "section_fill", "user_text")
+                   "draw_order", "print_width", "section_fill",
+                   "hatch_style", "user_text")
 
 
 def merge_scene(scene, path: str, notes: list | None = None) -> int:
@@ -457,6 +497,55 @@ def _check_version(doc: dict):
         raise ValueError(f"This file needs Serpentine3D {needs} or newer")
 
 
+def _patterns_used(scene) -> list:
+    """The patterns a drawing is drawn with that are not the app's own,
+    its own or installed: saved with it, so it is drawn the same where
+    they were never installed. One nothing names is not kept (#92).
+
+    A hatch carries the pattern it is drawn with, so one that is neither
+    the drawing's nor installed any more is saved from the hatch."""
+    from ..core.hatch import HatchShape
+    from ..core.hatch_patterns import HatchPattern, is_builtin
+    names = {la.hatch for la in scene.layers.all()}
+    names.update(str(h.pattern) for lay in scene.layouts
+                 for h in lay.hatches)
+    for obj in scene.all():
+        if obj.section_fill:
+            names.add(obj.section_fill.get("pattern", ""))
+    shapes = [obj.shape for obj in scene.all()]
+    shapes.extend(obj.shape for lay in scene.layouts for obj in lay.objects)
+    shapes.extend(shape for block in scene.block_defs.values()
+                  for shape in block["shapes"])
+    carried = {}
+    for shape in shapes:
+        if isinstance(shape, HatchShape):
+            names.add(str(shape.pattern))
+            if isinstance(shape.definition, HatchPattern):
+                carried.setdefault(str(shape.pattern).lower(),
+                                   shape.definition)
+    out, seen = [], set()
+    for name in names:
+        if not name or is_builtin(name) or name.lower() in seen:
+            continue
+        pattern = scene.hatch_pattern(name) or carried.get(name.lower())
+        if pattern is not None:
+            seen.add(name.lower())
+            out.append(pattern)
+    return sorted(out, key=lambda p: p.key)
+
+
+def _hatch_style(data: dict) -> dict | None:
+    """A hatch's own colour and background as a file has them, put right:
+    what is not one of its tokens is the layer's."""
+    from ..core.layers import hatch_background_token, hatch_color_token
+    out = {}
+    if data.get("color"):
+        out["color"] = hatch_color_token(data["color"])
+    if data.get("background"):
+        out["background"] = hatch_background_token(data["background"])
+    return out or None
+
+
 def _copy_hatch_look(layers, layer_id: str, ld: dict):
     """A layer's hatch angle, spacing and colour and the width and colour
     of its cut line, or the 45 degrees, 2.5 mm, ink and 0.5 mm of ink
@@ -465,7 +554,7 @@ def _copy_hatch_look(layers, layer_id: str, ld: dict):
     layers.set_hatch_spacing(layer_id, ld.get("hatch_spacing", 2.5))
     layers.set_hatch_color(layer_id, ld.get("hatch_color", "ink"))
     layers.set_hatch_background(layer_id,
-                                ld.get("hatch_background", "object"))
+                                ld.get("hatch_background", "none"))
     layers.set_cut_line_width(layer_id, ld.get("cut_line_width",
                                                DEFAULT_CUT_LINE_WIDTH))
     layers.set_cut_line_color(layer_id, ld.get("cut_line_color", "ink"))
@@ -557,11 +646,24 @@ def _load_doc(scene, doc: dict, blobs=None):
             "shapes": [geometry.shape_from_bytes(base64.b64decode(s))
                        for s in bd["shapes"]],
         }
-    from ..core.layout import layouts_from_json, sheet_groups_from_json
+    from ..core.layout import (layouts_from_json, lettered_by_font_size,
+                               lettered_in_builtin_styles,
+                               sheet_groups_from_json)
     scene.layouts = layouts_from_json(doc.get("layouts", []))
     scene.sheet_groups = sheet_groups_from_json(doc.get("sheet_groups", []))
     scene.annot_styles = {k: dict(v) for k, v in
                           doc.get("annot_styles", {}).items()}
+    # What is lettered keeps the sizes it was lettered at: in the built-in
+    # styles the file names, or, from a release before inch styles, the
+    # metric ones. With nothing lettered, the units choose (style_set).
+    scene.annot_style_set = (doc.get("annot_style_set", "metric")
+                             if lettered_in_builtin_styles(scene) else None)
+    # A drawing from before text heights were capital heights prints as it
+    # did, its heights font sizes; one with nothing lettered by them has
+    # nothing to keep (layout.letters_capitals).
+    scene.text_height_measures = doc.get(
+        "text_height_measures",
+        "em" if lettered_by_font_size(scene) else "capitals")
     from ..core.hatch_patterns import HatchPattern
     scene.hatch_patterns = {}
     for data in doc.get("hatch_patterns", []):
@@ -600,6 +702,8 @@ def _load_doc(scene, doc: dict, blobs=None):
                 k: v for k, v in od["section_fill"].items()
                 if k in ("pattern", "angle", "spacing", "color",
                          "cut_line_width", "cut_line_color", "background")})
+        if od.get("hatch_style"):
+            updates["hatch_style"] = _hatch_style(od["hatch_style"])
         text = user_text.cleaned(od.get("user_text"))
         if text:
             updates["user_text"] = text
@@ -611,6 +715,15 @@ def _load_doc(scene, doc: dict, blobs=None):
             updates["block_id"] = od["block"]
         if updates:
             scene.update(obj.id, **updates)
+
+    # A drawing from before a hidden clipping plane cut stopped a plane by
+    # hiding it, or its layer: one it hid is paused, so it opens as saved.
+    if not doc.get("hidden_planes_cut"):
+        from ..core import clipping
+        for obj in clipping.planes_of(scene):
+            if obj.clip_plane.get("enabled") and clipping.hidden(scene, obj):
+                scene.update(obj.id, clip_plane={**obj.clip_plane,
+                                                 "enabled": False})
 
     for cd in doc.get("pointclouds", []):
         cloud = _cloud_from_json(cd, blobs)

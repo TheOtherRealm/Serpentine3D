@@ -7,16 +7,16 @@ import numpy as np
 from ..core import clipping
 from ..core import geometry as g
 from ..core.layout import (
-    PAPER_SIZES, DetailView, Layout, LinearDim, TextNote, format_scale,
-    hatch_patterns_of, parse_scale, pattern_label, pattern_named,
-    unique_layout_name,
+    PAPER_SIZES, DetailView, Layout, LinearDim, TextNote, annotation_style,
+    default_note_height, format_scale, hatch_patterns_of, parse_scale,
+    pattern_label, pattern_named, unique_layout_name,
 )
-from ..utils.units import TO_MM
+from ..utils.units import TO_MM, format_paper_size, paper_units
 # a detail view named "front" should look where the front view looks
 from ..ui.camera import STANDARD_VIEWS as _VIEW_ANGLES
 from .base import (
-    FileReq, FormField, FormReq, NumberReq, OptionReq, PointReq, SelectReq,
-    TextReq, TextEditorReq, command, has_text_editor,
+    FileReq, FormField, FormReq, LengthReq, NumberReq, OptionReq, PointReq,
+    SelectReq, TextReq, TextEditorReq, command, has_text_editor,
 )
 from .regions import coplanar_curves, pick_regions
 
@@ -61,7 +61,8 @@ def cmd_layout(ctx):
             ctx.echo("No layouts. Use 'layout' > New to create one.")
         else:
             ctx.echo("Layouts: " + ", ".join(
-                f"{lay.name} ({lay.paper_w:g}x{lay.paper_h:g}mm, "
+                f"{lay.name} ("
+                f"{format_paper_size(lay.paper_w, lay.paper_h, scene.units)}, "
                 f"{len(lay.details)} details)" for lay in scene.layouts))
         return
 
@@ -71,11 +72,19 @@ def cmd_layout(ctx):
         size = yield OptionReq(
             "Paper size", options=list(PAPER_SIZES) + ["Custom"],
             default="A3")
-        if size == "Custom":
+        if size == "Custom" and paper_units(scene.units) == "mm":
             w = yield NumberReq("Paper width (mm)", default=420.0,
                                 minimum=10)
             h = yield NumberReq("Paper height (mm)", default=297.0,
                                 minimum=10)
+        elif size == "Custom":
+            # in the units the sheet is read in, from Tabloid
+            per = TO_MM["in"]
+            w = yield NumberReq("Paper width (in)", default=17.0,
+                                minimum=10 / per)
+            h = yield NumberReq("Paper height (in)", default=11.0,
+                                minimum=10 / per)
+            w, h = w * per, h * per
         else:
             orientation = yield OptionReq(
                 "Orientation", options=["Landscape", "Portrait"],
@@ -88,7 +97,8 @@ def cmd_layout(ctx):
         scene.notify()
         if _window(ctx) is not None:
             _window(ctx).switch_space(lay.id)
-        ctx.echo(f"Created layout '{name}' ({w:g}x{h:g}mm). "
+        ctx.echo(f"Created layout '{name}' "
+                 f"({format_paper_size(w, h, scene.units)}). "
                  "Use 'detail' to place views of the model.")
         return
 
@@ -434,15 +444,18 @@ def cmd_text(ctx):
     pos = yield PointReq("Text position (baseline anchor)")
     if has_text_editor(ctx) or getattr(ctx, "replay_text_inline", False):
         answer = yield TextEditorReq(
-            "Text", units="mm", anchor=pos, paper_layout=lay)
+            "Text", units=paper_units(ctx.scene.units), anchor=pos,
+            paper_layout=lay,
+            values={"height": default_note_height(ctx.scene)})
         if isinstance(answer, dict):
             ctx.echo("Note placed.")
             return
     content = yield TextReq(r"Text (\n for a new line)")
     content = content.replace("\\n", "\n")
-    height = yield NumberReq("Text height (mm)", default=4.0, minimum=0.5,
-                             choices={"Style": ["None", "Standard", "Small",
-                                                "Heading"]})
+    height = yield LengthReq(
+        "Text height", paper=True, default=default_note_height(ctx.scene),
+        minimum=0.5, choices={"Style": ["None", "Standard", "Small",
+                                        "Heading"]})
     style = ctx.opt("Style", "None")
     lay.notes.append(TextNote(x=pos[0], y=pos[1], text=content,
                               height=float(height),
@@ -471,13 +484,14 @@ def cmd_dim(ctx):
         return
     n = np.array([-d[1], d[0]]) / length
     offset = float(np.dot(np.array(p3[:2]) - a, n))
-    # dimensions over a detail read in model units at the detail's scale
+    # dimensions over a detail read in model units at the detail's scale,
+    # and ones on bare paper read the paper
     mid = (a + b) / 2
     detail = lay.detail_at(float(mid[0]), float(mid[1]))
-    scale_denom = detail.scale_denom if (detail and
-                                         not detail.perspective) else 1.0
+    scale_denom, on_paper = _dim_scale_at(lay, float(mid[0]), float(mid[1]))
     dim = LinearDim(x1=p1[0], y1=p1[1], x2=p2[0], y2=p2[1],
-                    offset=offset, scale_denom=scale_denom)
+                    offset=offset, scale_denom=scale_denom,
+                    measures_paper=on_paper)
     # anchor to the detail: the dim follows detail pan/zoom/rescale
     if detail is not None and not detail.perspective \
             and detail.contains(p1[0], p1[1]) \
@@ -488,11 +502,14 @@ def cmd_dim(ctx):
         dim.m2 = detail_unproject(detail, p2[0], p2[1])
     lay.dims.append(dim)
     ctx.scene.notify()
-    measured = length * scale_denom
-    ctx.echo(f"Dimension placed: {measured:g}"
-             + (f" (anchored to detail at "
-                f"{detail.scale_text(ctx.scene.units)})"
-                if dim.detail_id else " mm on paper"))
+    if on_paper:
+        ctx.echo(f"Dimension placed: {ctx.scene.format_paper_length(length)}"
+                 " on paper")
+    else:
+        ctx.echo(f"Dimension placed: "
+                 f"{ctx.scene.format_length(length * scale_denom)} "
+                 f"({'anchored to' if dim.detail_id else 'through'} the detail "
+                 f"at {detail.scale_text(ctx.scene.units)})")
 
 @command("leader", space="paper")
 def cmd_leader(ctx):
@@ -852,24 +869,22 @@ def _regions_to_fill(ctx, curves):
 
 @command("hatchpatterns", aliases=("loadpat", "loadhatchpatterns"))
 def cmd_hatchpatterns(ctx):
-    """The drawing's hatch patterns (#92): Load the patterns in a .pat
-    file, Delete one that was loaded, or Purge every loaded one nothing
-    is drawn with. The app's own patterns are always there.
+    """Hatch patterns from .pat files (#92): Load installs the patterns in
+    one, Delete takes one off again. The app's own are always there.
 
-    AutoCAD's acad.pat and acadiso.pat, a Revit export and most patterns
-    found online are .pat files. What is loaded is saved with the drawing,
-    and offered wherever a hatch or a layer's section hatch is picked.
+    An installed pattern is offered in every drawing, as a font is, and a
+    drawing saves the patterns it uses, so it is drawn the same on a
+    computer that never installed them. AutoCAD's acad.pat and
+    acadiso.pat, a Revit export and most patterns found online are .pat
+    files.
     """
-    # Patterns are the drawing's, not the picked objects': whatever was
-    # picked, often the very hatch a pattern is being loaded for, stays.
+    # Patterns are not the picked objects': whatever was picked, often the
+    # very hatch a pattern is being loaded for, stays.
     held = list(ctx.selection.ids)
-    action = yield OptionReq("Hatch patterns",
-                             options=["Load", "Delete", "Purge"],
+    action = yield OptionReq("Hatch patterns", options=["Load", "Delete"],
                              default="Load")
     if action == "Delete":
         yield from _delete_pattern(ctx)
-    elif action == "Purge":
-        _purge_patterns(ctx)
     else:
         yield from _load_patterns(ctx)
     if held:
@@ -878,7 +893,7 @@ def cmd_hatchpatterns(ctx):
 
 def _load_patterns(ctx):
     import os
-    from ..core.hatch_patterns import PatternError, merge_into, read_pat
+    from ..core.hatch_patterns import PatternError, install, read_pat
     path = yield FileReq("Hatch pattern file", default="~/",
                          title="Load hatch patterns",
                          filters="Hatch patterns (*.pat);;All files (*)")
@@ -889,9 +904,13 @@ def _load_patterns(ctx):
     except (OSError, PatternError) as exc:
         ctx.echo(f"Could not read {os.path.basename(path)}: {exc}")
         return
-    named = merge_into(ctx.scene.hatch_patterns, patterns, source=source)
-    # what the drawing calls them now, in the file's order, for the window
-    # that asked for the file to switch to the first
+    try:
+        named = install(patterns, source=source)
+    except OSError as exc:
+        ctx.echo(f"Could not install the patterns: {exc}")
+        return
+    # what they are called now, in the file's order, for the window that
+    # asked for the file to switch to the first
     ctx.scene.loaded_patterns = list(dict.fromkeys(named.values()))
     ctx.scene.notify()
     if not named:
@@ -900,57 +919,46 @@ def _load_patterns(ctx):
     shown = [new if new == old else f"{old} as {pattern_label(new)}"
              for old, new in named.items()]
     listed = ", ".join(shown[:8]) + (", …" if len(shown) > 8 else "")
-    ctx.echo(f"Loaded {len(named)} hatch pattern"
+    ctx.echo(f"Installed {len(named)} hatch pattern"
              f"{'s' if len(named) != 1 else ''} from "
              f"{os.path.basename(path)}: {listed}.")
 
 
 def _delete_pattern(ctx):
-    """Take a loaded pattern out of the drawing. Whatever names it draws
-    as lines from then on, as a name the drawing has no pattern by always
-    has; a hatch in the model keeps drawing it, since it carries its own."""
-    names = list(ctx.scene.hatch_patterns)
-    if not names:
-        ctx.echo("No loaded hatch patterns to delete; the app's own "
-                 "always stay.")
+    """Uninstall a pattern, or take one a drawing brought with it out of
+    the drawing. Nothing drawn with it changes: a drawing that uses it
+    keeps it, and goes on saving it, so deleting is never a way to break
+    a drawing."""
+    from ..core.hatch_patterns import installed, lookup, resolve, uninstall
+    scene = ctx.scene
+    names: dict = {}
+    for name in (*installed(), *scene.hatch_patterns):
+        names.setdefault(name.lower(), name)
+    options = sorted(names.values(), key=str.lower)
+    if not options:
+        ctx.echo("No hatch patterns to delete; the app's own always stay.")
         return
-    name = yield OptionReq("Pattern to delete", options=names,
-                           default=names[0])
-    name = next((n for n in names if n.lower() == str(name).lower()), None)
+    name = yield OptionReq("Pattern to delete", options=options,
+                           default=options[0])
+    name = names.get(str(name).lower())
     if name is None:
         return
-    users = ctx.scene.hatch_pattern_users(name)
-    del ctx.scene.hatch_patterns[name]
-    ctx.scene.notify()
-    ctx.echo(f"Deleted hatch pattern {name}.")
-    redrawn = {k: v for k, v in users.items() if k != "hatch"}
-    if any(redrawn.values()):
-        ctx.echo(f"{_users_text(redrawn)} named it, and now draw lines.")
-    if users.get("hatch"):
-        ctx.echo(f"{_users_text({'hatch': users['hatch']})} in the model "
-                 "keep drawing it.")
-
-
-def _purge_patterns(ctx):
-    """Every loaded pattern nothing in the drawing is drawn with."""
-    unused = [n for n in ctx.scene.hatch_patterns
-              if not any(ctx.scene.hatch_pattern_users(n).values())]
-    for name in unused:
-        del ctx.scene.hatch_patterns[name]
-    if unused:
-        ctx.scene.notify()
-        ctx.echo(f"Purged {len(unused)} unused hatch pattern"
-                 f"{'s' if len(unused) != 1 else ''}: {', '.join(unused)}.")
+    in_use = any(scene.hatch_pattern_users(name).values())
+    pattern = resolve(scene.hatch_patterns, name)
+    was_installed = uninstall(name)
+    if in_use:
+        if pattern is not None and lookup(scene.hatch_patterns, name) is None:
+            scene.hatch_patterns[pattern.name] = pattern
     else:
-        ctx.echo("Every loaded hatch pattern is in use.")
-
-
-def _users_text(users: dict) -> str:
-    words = {"layer": ("layer", "layers"), "object": ("object", "objects"),
-             "sheet": ("sheet hatch", "sheet hatches"),
-             "hatch": ("hatch", "hatches")}
-    parts = [f"{n} {words[kind][n != 1]}" for kind, n in users.items() if n]
-    return " and ".join(parts)
+        for key in [k for k in scene.hatch_patterns
+                    if k.lower() == name.lower()]:
+            del scene.hatch_patterns[key]
+    scene.notify()
+    if in_use:
+        ctx.echo(f"{'Deleted' if was_installed else 'Kept'} hatch pattern "
+                 f"{name}; this drawing uses it and keeps it.")
+    else:
+        ctx.echo(f"Deleted hatch pattern {name}.")
 
 
 def _round_spacing(size: float) -> float:
@@ -966,9 +974,13 @@ def _round_spacing(size: float) -> float:
 
 
 def _dim_scale_at(lay, x, y):
+    """The scale a dimension placed at paper (x, y) measures at, and whether
+    it measures the paper: it does on bare paper, and over a perspective
+    detail, which has no scale to read the model at."""
     detail = lay.detail_at(x, y)
-    return (detail.scale_denom if detail and not detail.perspective
-            else 1.0)
+    if detail is None or detail.perspective:
+        return 1.0, True
+    return detail.scale_denom, False
 
 
 @command("dimradius", aliases=("dimr",), space="paper")
@@ -981,10 +993,10 @@ def cmd_dimradius(ctx):
     from ..core.layout import RadialDim
     center = yield PointReq("Circle centre (on the paper)")
     edge = yield PointReq("Point on the circle", rubber_from=center)
+    scale_denom, on_paper = _dim_scale_at(lay, center[0], center[1])
     lay.rdims.append(RadialDim(
         cx=center[0], cy=center[1], px=edge[0], py=edge[1],
-        diameter=False,
-        scale_denom=_dim_scale_at(lay, center[0], center[1])))
+        diameter=False, scale_denom=scale_denom, measures_paper=on_paper))
     ctx.scene.notify()
     ctx.echo("Radius dimension placed.")
 
@@ -999,9 +1011,10 @@ def cmd_dimdiameter(ctx):
     from ..core.layout import RadialDim
     center = yield PointReq("Circle centre (on the paper)")
     edge = yield PointReq("Point on the circle", rubber_from=center)
+    scale_denom, on_paper = _dim_scale_at(lay, center[0], center[1])
     lay.rdims.append(RadialDim(
         cx=center[0], cy=center[1], px=edge[0], py=edge[1], diameter=True,
-        scale_denom=_dim_scale_at(lay, center[0], center[1])))
+        scale_denom=scale_denom, measures_paper=on_paper))
     ctx.scene.notify()
     ctx.echo("Diameter dimension placed.")
 
@@ -1214,12 +1227,11 @@ def cmd_dimstyle(ctx):
     ctx.echo("Styles: " + ", ".join(known))
     name = yield TextReq("Style name (new or existing)", default="Standard")
     name = name.strip() or "Standard"
-    from ..ui.annot_paint import style_of
-    cur = style_of(ctx.scene, name)
-    th = yield NumberReq("Text height (mm)", default=cur["text_height"],
-                         minimum=0.5)
-    ar = yield NumberReq("Arrow size (mm)", default=cur["arrow_size"],
-                         minimum=0.2)
+    cur = annotation_style(ctx.scene, name)
+    th = yield LengthReq("Text height", paper=True,
+                         default=cur["text_height"], minimum=0.5)
+    ar = yield LengthReq("Arrow size", paper=True,
+                         default=cur["arrow_size"], minimum=0.2)
     ctx.scene.annot_styles[name] = {"text_height": float(th),
                                     "arrow_size": float(ar),
                                     "dim_offset": cur["dim_offset"]}
@@ -1292,8 +1304,9 @@ def cmd_sheetindex(ctx):
     for i, l in enumerate(ctx.scene.layouts, start=1):
         title = l.title_block.get("fields", {}).get("title", "")
         lines.append(f"{i:>2}  {l.name}" + (f" — {title}" if title else ""))
+    height = annotation_style(ctx.scene, "Standard")["text_height"]
     lay.notes.append(TextNote(x=pos[0], y=pos[1], text="\n".join(lines),
-                              height=3.2))
+                              height=height))
     ctx.scene.notify()
     ctx.echo(f"Sheet index placed ({len(ctx.scene.layouts)} sheets).")
 

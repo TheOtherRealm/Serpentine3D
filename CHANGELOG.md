@@ -1,34 +1,44 @@
 # Changelog
 
-## Unreleased
+## 0.12.2 (2026-10-26)
 
 ### Added
 
 - **Hatch patterns from .pat files (#92).** The industry's hatch patterns
-  are stored in .pat files, and `hatchpatterns` (`loadpat`) loads one into
-  the drawing: acad.pat, acadiso.pat, a Revit export or a pattern found
-  online. Its patterns are offered beside the app's own wherever a
-  pattern is picked, for a hatch in the model or on a sheet and for the
-  section hatch of a layer or an object. Every pattern list in Properties
-  ends in Load patterns… and Delete patterns…; a load keeps what is picked
-  and switches it to the first pattern the file brought. `hatchpatterns`
-  also deletes a loaded pattern, whatever named it then drawing lines,
-  and purges every loaded one nothing uses. Dashes, gaps and dots are
-  drawn as the file says, on screen, on a clipping plane's cap, on a sheet
+  are stored in .pat files, and `hatchpatterns` (`loadpat`) installs the
+  ones in a file, the way a font is installed: acad.pat, acadiso.pat, a
+  Revit export or a pattern found online. From then on they are offered
+  in every drawing beside the app's own, wherever a pattern is picked,
+  for a hatch in the model or on a sheet and for the section hatch of a
+  layer or an object. A drawing saves the patterns it uses, so it is
+  drawn the same on a computer that never installed them. Every pattern
+  list in Properties ends in Load patterns… and Delete patterns…; a load
+  keeps what is picked and switches it to the first pattern the file
+  brought, and deleting a pattern an open drawing uses leaves the drawing
+  its copy. Dashes, gaps and dots are drawn as the file says, dots as
+  small filled circles, on screen, on a clipping plane's cap, on a sheet
   and in a PDF. A pattern's spacing is the distance between its rows, so
   a layer changed from Lines to ANSI31 keeps the look it had, whatever
-  unit the file was written in. What is loaded is saved with the drawing,
-  a hatch in the model carries its pattern with it, and a DXF export
-  writes the pattern under its own name, Lines and Cross where they lie
-  here. A layer may name a pattern the drawing has not loaded yet; its
-  cuts are drawn with lines until it is.
+  unit the file was written in. A hatch in the model carries its pattern
+  with it, and a DXF export writes the pattern under its own name, Lines
+  and Cross where they lie here. A layer may name a pattern there is no
+  pattern by yet; its cuts are drawn with lines until there is.
+  Contributed by Jonas Pedrotti (#111).
 - **A hatch is its fill.** As in Rhino and AutoCAD, a hatch no longer
   draws a line round itself or its holes, in the model, in a detail or on
   a sheet; its edge is the linework it was made from. It still snaps to
-  its edge's ends and middles.
+  its edge's ends and middles. Contributed by Jonas Pedrotti (#111).
+- **A hatch has a colour and a background.** A hatch in the model takes
+  its layer's Hatch colour and Hatch background, and its Properties can
+  give it its own of either, By layer to begin with. A background fills
+  the hatch under its lines, in the model, on a sheet and in the PDF, and
+  a click anywhere inside a hatch picks it, as in Rhino. A detail draws
+  its hatches under the rest of its linework, each in its colour and at
+  its print width. Contributed by Jonas Pedrotti (#114).
 - **A few patterns every drawing has.** As in Rhino, one of each basic
   form and none that is another turned or scaled: Lines, Cross and Solid
   as before, and now Dash, Dots, Plus, Squares, Triangles and Brick.
+  Contributed by Jonas Pedrotti (#111).
 - **Hatches from Rhino and AutoCAD look as they did there (#92).** A
   .3dm's hatches come in with the patterns of the file's own pattern
   table, at their scale and rotation and laid from their base points, and
@@ -38,18 +48,19 @@
   comes in looking the same. A pattern that draws like one of the app's
   own becomes that one, and one that only shares a name with one is kept
   apart as, say, "BRICK (dxf)". The patterns come into the drawing's list.
+  Contributed by Jonas Pedrotti (#111).
 - **A cut's hatch has a background of its own (#91).** Layers, and objects
-  with a section style of their own, have a Hatch background: Object, a
+  with a section style of their own, have a Hatch background: None, a
   darker shade of the object on screen and bare paper on a sheet as
   before, or the layer's colour or one of its own, which fills the cut
   under its hatch on screen and on paper alike. Scripts set it as
-  `hatch_background`.
+  `hatch_background`. Contributed by Jonas Pedrotti (#111).
 - **The hatch popup shows the hatch while it is open.** Changing the
   pattern, spacing or angle redraws the hatch it would make, in the model
   and on a sheet, before OK makes it. At the prompt each answer shows the
   same. A solid hatch is ghosted as a fill as strong as any other
   pattern's lines, and Solid on a sheet is the ink of a hatch's lines
-  rather than a see-through grey.
+  rather than a see-through grey. Contributed by Jonas Pedrotti (#111).
 - **A clipping plane can be switched off in some views and not others.**
   Rhino lets a clipping plane choose the views it cuts, and a sheet needs
   it: a plan detail cut at sill height, a section detail cut down the
@@ -70,9 +81,108 @@
   setting from `scene_info`. Enter on nothing at any of the four
   commands' prompts now means every plane, as the prompts always said,
   rather than cancelling.
+- **A picked solid shows where it is cut.** Where a clipping plane cuts a
+  solid, its cut line turns gold while the solid is picked, in the model
+  and in a detail, where the cut can be all there is to see of it.
+  Contributed by Jonas Pedrotti (#114).
+- **A hidden-line detail shows its print widths.** On the sheet, each of
+  a hidden-line detail's lines is drawn by its print width, as a layer
+  that follows its print width is in the model, so a heavy wall reads
+  heavy before the sheet is printed. A line with no print width is drawn
+  as before. Contributed by Jonas Pedrotti (#114).
+
+### Changed
+
+- **A hidden clipping plane still cuts.** As in Rhino, hiding a clipping
+  plane, or turning its layer off, now only puts the plane out of sight:
+  it goes on cutting, so a section is kept without the plane in the way,
+  and pausing it with `disableclippingplane` or switching it off in a
+  view is what stops the cut. Before, a hidden plane stopped cutting. As
+  nothing on screen then shows why part of a model is missing, a pane a
+  plane cuts says so in its title, "Perspective · Shaded · Cut", and the
+  title's menu lists every plane that cuts it, the hidden ones marked
+  hidden, with Show Hidden Planes to bring them back in sight. A detail's
+  list of planes in Properties names the hidden ones too, and hiding a
+  plane that cuts, with `hide`, `isolate`, `layer` or a layer's
+  visibility box, says that it still cuts. Only a plane in sight draws
+  its arrow. A drawing saved before this opens with the planes it hid
+  paused, so it looks as it was saved. Contributed by Jonas Pedrotti
+  (#114).
 
 ### Fixed
 
+- **A drawing whose hatching 0.12.1 would lose says it needs 0.12.2.**
+  0.12.1 opens a newer drawing and keeps only what it knows of its
+  hatching. A hatch's own colour or background, a cut's background, a cut
+  in any pattern but Lines, Cross or Solid, and the patterns a drawing
+  carries went without a word, and a save from there lost them for good.
+  Such a drawing is now written as file version 8 and names the release
+  that keeps it, so 0.12.1 refuses it by name. Hatching it can keep is
+  written exactly as before.
+
+- **A section on a sheet keeps its corners.** A detail traced each face a
+  cut leaves at points spaced evenly round its loops, so every corner was
+  cut off, and the cut line and the hatching drew the chamfer, on the
+  sheet and in the PDF. Each loop is now followed edge by edge: a
+  straight side is its two ends, and a curve is followed closely.
+  Contributed by Jonas Pedrotti (#114).
+- **The Windows installer leaves out OpenGL libraries nothing loads (#77).**
+  PyOpenGL carries its GLUT and GLE libraries built for three Visual C++
+  runtimes and loads only the newest, so the installer carried two sets that
+  were never used, 1.2 MB in all, and every build warned that their runtimes
+  were missing. Contributed by MaxKarpyza.
+
+- **A sheet reads in inches in an inch or feet document.** A dimension on
+  bare paper wrote its paper millimetres with the document's unit after
+  them, so 50.8 mm of paper read 50.8" in an inch document and 50.8 cm in
+  a centimetre one. Typing on paper took a bare number as millimetres but
+  a unit as the document's, so `1in,1in` on an inch sheet landed 1 mm in.
+  A sheet now reads and is typed in the units Rhino's templates give their
+  layouts: inches in an inch or feet document, millimetres in a metric
+  one. That goes for dimensions on bare paper, on screen and in the PDF
+  and DXF, the length beside the cursor, the gumball, Properties, sheet
+  sizes and whatever is typed there, where `50mm` and `1in` still mean
+  what they say. A dimension over a detail reads the model, as before, and
+  print widths and hatch spacing stay in millimetres. A sheet is still kept
+  in millimetres, so a drawing opens and plots as it did, and its
+  dimensions on bare paper read in the sheet's units too.
+- **Text on a sheet is sized in the sheet's units.** In an inch or feet
+  document a note's cap height, in Properties and at the `text` prompt, and
+  a style's text and arrow sizes at `dimstyle` read and were typed in
+  millimetres, so 1/8" text had to be typed as 3.175. They now read and are
+  typed in inches there, as CAD letters a drawing in its own units, and
+  `5mm` or `1/8"` still mean what they say. An inch drawing's built-in
+  styles letter at round inches: Standard 1/8", Small 0.09" and Heading
+  1/4", in place of 3.2, 2.2 and 6 mm. A drawing lettered before keeps the
+  sizes it was lettered at, and so does one whose units change.
+- **Text on a sheet prints as tall as its height.** Drafting measures a
+  text height as the height of the capitals, and a note made in the
+  on-screen editor was drawn that way. Dimension and leader text and a note
+  placed at the `text` prompt gave their height to the font as its size,
+  which also holds room for the tails of g and p and for accents, so their
+  capitals printed about 0.71 of it: 1/8" Standard text came out 0.09",
+  and two notes the same height disagreed. They all print capitals at
+  their height now, and a dimension's text sits centred on its line. A
+  drawing saved before goes on printing as it did, as text 40% larger
+  could crowd what is around it, and the title block, scale bar and
+  revision table keep their sizes in any drawing. A note picks anywhere on
+  its letters, the end of a long line and a second line included.
+- **A solid measures its true volume, whatever its faces are made of
+  (#104).** A bow limb from Rhino, a valid solid of 18 NURBS faces, read
+  0.8% light, while its area and a fine mesh of it were right. The exact
+  volume came from OpenCascade's default integration, which lays one rule
+  of up to 61 points across a whole face and, for a volume, counts them
+  from the face's edges and one direction of its surface but never the
+  other. A small face at the limb's tip, 16 spans across, got as few as 8
+  points and read 12% short, and that was nearly all of the 0.8%. A face
+  of many spans now has its volume, area and centre integrated span by
+  span; a face that is one smooth piece is measured as before. The same
+  blind spot read an extrusion of a curve through 30 points 2% heavy, and
+  openNURBS sample files up to 1.6% out in volume and 0.8% in area. None
+  of those is now off by more than 0.01%, though an area takes about
+  twice as long to work out. A NURBS face closed both ways, as a ring
+  scaled to an oval is, no longer reads half its volume. Reported by
+  DarkBiscuits.
 - **A detail's scale is real size in any units (#102).** A detail took
   the model units one millimetre of paper shows for its ratio, which it
   is only in millimetres. In an inch document "1:4" showed four inches to
@@ -97,9 +207,8 @@
   have both at once. A shaded one closes what it cuts with the model
   view's caps, hatched at the hatch's spacing on the paper and outlined
   at its print width, so the two kinds of detail read alike on one sheet.
-  The plane itself still draws in a detail, as everywhere else; leave its
-  layer out of the detail for a clean section that still cuts. Reported
-  by lourencovp.
+  The plane itself is not drawn on a sheet, so a section there is clean.
+  Reported by lourencovp.
 
 - **Inside a detail, Properties and Delete follow what you pick (#93).**
   The click before a double-click picks the detail on the sheet, as the
@@ -128,7 +237,8 @@
   session record carries it through undo and paste, and a PLY export of a
   far scan is written as doubles rather than rounded on the way out. Old
   files have no origin and open exactly as they did; a file of clouds
-  near the world's origin is byte for byte what it was before.
+  near the world's origin is byte for byte what it was before. Contributed
+  by Jonas Pedrotti (#86).
 
 - **A far model goes out of the program with the detail it has.** The
   sweep that followed the two fixes above found the same rounding on
@@ -150,6 +260,7 @@
   since a curve leaves a `.3dm` as a NURBS curve at full precision. On screen, the rubber band, a command's preview
   and a detail view on a sheet were each casting model points to float32
   before the anchor could subtract anything; they no longer do.
+  Contributed by Jonas Pedrotti (#86).
 
 - **A millimetre detail at survey coordinates is the size you modelled
   it.** 0.8.1 stopped far geometry swimming while the camera moved, but
@@ -175,7 +286,7 @@
   offsets untouched and folds the mesh's origin into its matrix, a pick
   moves the ray into the mesh rather than the mesh into the world, and a
   clipping plane travels to the mesh instead of the mesh travelling to
-  it.
+  it. Contributed by Jonas Pedrotti (#86).
 
 - **A file holding far geometry says which release can read it.** The
   offsets and their origin are new, and a reader that knows nothing of
@@ -185,7 +296,7 @@
   drawing carrying an origin is written as file version 7 and names the
   release that reads it, the way hatches and user text did; a drawing
   near home is written exactly as before and opens in every release it
-  did before.
+  did before. Contributed by Jonas Pedrotti (#86).
 
 - **Zooming in on a far model no longer empties the view.** The clip
   planes wrap the drawing and the grid together, and the near plane is
