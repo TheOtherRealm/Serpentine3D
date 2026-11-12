@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 import httpx
 from .client import AiError, _friendly_http_error
 import pprint
-from icecream import ic
+# from icecream import ic
 DEFAULT_ENDPOINT = "http://127.0.0.1:1234"
 def dump_recursive(obj, indent=0, visited=None):
     if visited is None:
@@ -128,7 +128,7 @@ class LocalClient:
         return AiError(_friendly_http_error(status, body))
 
     def _request_error(self, exc):
-        ic(self,exc)
+        # ic(self,exc)
         dump_recursive(self)
         return AiError(f"LM Studio request failed: {exc}. Check that its local server and model are running.")
 

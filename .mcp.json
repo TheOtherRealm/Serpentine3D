@@ -10,8 +10,10 @@
   {
     "mcpServers": {
       "serpentine3d": {
-        "command": "C:\\Users\\Someone\\AppData\\Local\\Programs\\Serpentine3D\\serp3d.exe",
+        "command": "C:\\Develop\\githubcontributions\\Serpentine3D\\.venv\\Scripts\\python.exe",
         "args": [
+          "-m",
+          "serpentine3d",
           "--mcp"
         ]
       }

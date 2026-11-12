@@ -5,10 +5,15 @@ from __future__ import annotations
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QPlainTextEdit, QPushButton,
+    QHBoxLayout, QLabel, QTextEdit, QPushButton,
     QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
-
+from PySide6.QtWidgets import (
+    QTextEdit, QToolBar, 
+    QFileDialog, QVBoxLayout, QWidget
+)
+from PySide6.QtGui import QTextImageFormat
+from PySide6.QtCore import QUrl
 from ..api import SerpApi
 from ..ui.workspace_icons import workspace_icon
 from .agent import Agent, build_system_prompt
@@ -28,9 +33,10 @@ _HINT = ("Try: “a spiral staircase, 3 m tall, 14 steps” · “fillet every "
          "edge of the box 2 mm” · “what's in this scene?”")
 
 
-class PromptInput(QPlainTextEdit):
+class PromptInput(QTextEdit):
     """Multi-line input: Enter sends, Shift+Enter inserts a newline."""
-
+    def __init__(self):
+        super().__init__()
     submitted = Signal()
 
     def keyPressEvent(self, ev: QKeyEvent):
@@ -40,6 +46,40 @@ class PromptInput(QPlainTextEdit):
             ev.accept()
             return
         super().keyPressEvent(ev)
+    def create_toolbar(self):
+        toolbar = QToolBar("Main Toolbar")
+        self.addToolBar(toolbar)
+        # Insert Image Action
+        insert_image_action = toolbar.addAction("🖼️ Insert Image")
+        insert_image_action.triggered.connect(self.insert_image)
+        # Optional: Add formatting options to prove WYSIWYG capability
+        toolbar.addSeparator()
+        bold_action = toolbar.addAction("Bold")
+        bold_action.triggered.connect(lambda: self.text_edit.setFontWeight(
+            700 if self.text_edit.fontWeight() != 700 else 400
+        ))
+        italic_action = toolbar.addAction("Italic")
+        italic_action.triggered.connect(lambda: self.text_edit.setFontItalic(
+            not self.text_edit.fontItalic()
+        ))
+    def insert_image(self):
+        # 1. Open file dialog to select an image file
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Image", "", "Images (*.png *.jpg *.jpeg *.bmp *.gif)"
+        )
+        if file_path:
+            # 2. Get the current cursor position
+            cursor = self.text_edit.textCursor()
+            
+            # 3. Define the image format configuration
+            image_format = QTextImageFormat()
+            image_format.setName(QUrl.fromLocalFile(file_path).toString())
+            
+            # Optional: Set a default maximum display width so large photos don't overflow
+            image_format.setWidth(400) 
+
+            # 4. Insert the image at the cursor position
+            cursor.insertImage(image_format)
 
 
 class AiPanel(QWidget):
