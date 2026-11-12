@@ -1248,6 +1248,7 @@ class Viewport(QOpenGLWidget):
         self._draw_span = None              # (from, to) of the open leg
         self._draw_frame = None             # (sides, corner) when it is a box
         self._choice_hover = None           # row the object chooser is on
+        self._flashes: dict[str, float] = {}    # object id -> when it lit
         self._chooser = None                # the open chooser, if there is one
         self._hold_mods = None              # modifiers it went down with
         self._hold_timer = QTimer(self)     # how long the button has been still
@@ -1317,7 +1318,7 @@ class Viewport(QOpenGLWidget):
         self._tessDone.connect(self._on_tess_done,
                                Qt.ConnectionType.QueuedConnection)
         self._preview: _LineBatch | None = None
-        self._preview_data = np.zeros((0, 3), np.float32)
+        self._preview_data = np.zeros((0, 3))
         self._ghost = None                     # DisplayMesh of pending result
         self._ghost_picture = None             # textured pending picture
         self._inline_text_editor = None
@@ -2587,6 +2588,10 @@ class Viewport(QOpenGLWidget):
             selected = self._looks_selected(obj.id)
             gold = self._selection_color(obj.id) if selected else None
             color = gold if selected else self.scene.color_of(obj)
+            lit = self._flash_amount(obj.id)
+            if lit:
+                color = tuple(c + (f - c) * lit
+                              for c, f in zip(color, theme.CHANGE_FLASH))
             locked = obj.locked or obj.layer_id in locked_layers
             if locked and not selected:
                 grey = (color[0] + color[1] + color[2]) / 3 * 0.55 + 0.18
@@ -2680,7 +2685,7 @@ class Viewport(QOpenGLWidget):
             # and switching them off would empty the drawing.
             if gpu.line_count and (selected or show_edges or not gpu.tri_count):
                 if selected:
-                    edge_color = (*gold, 1.0)
+                    edge_color = (*color, 1.0)    # gold, or lit by a flash
                 elif obj.kind in ("curve", "hatch"):
                     edge_color = (*line_color, 1.0)
                 else:
@@ -3212,7 +3217,7 @@ class Viewport(QOpenGLWidget):
         the same window it went in, or it lands on the sheet at the model's
         own numbers.
         """
-        arr = np.asarray(pts, np.float32).reshape(-1, 3)
+        arr = np.asarray(pts, float).reshape(-1, 3)
         entered = self._drawing_through()
         if entered is None:
             return arr
@@ -3243,8 +3248,8 @@ class Viewport(QOpenGLWidget):
         else:
             size = self.camera.distance * 0.008
         for m in markers:
-            m = np.asarray(m, np.float32)
-            for axis in np.eye(3, dtype=np.float32) * size:
+            m = np.asarray(m, float)
+            for axis in np.eye(3) * size:
                 segs.append(np.stack([m - axis, m + axis]))
         GL.glDisable(GL.GL_DEPTH_TEST)
         if held is not None:
@@ -3268,11 +3273,10 @@ class Viewport(QOpenGLWidget):
                 if self._drawing_through() is not None:
                     at = self._on_paper([snap[0]])[0]
                 else:
-                    at = np.asarray(snap[0], np.float32)
-                axes = (np.array([1.0, 0.0, 0.0], np.float32),
-                        np.array([0.0, 1.0, 0.0], np.float32))
+                    at = np.asarray(snap[0], float)
+                axes = (np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]))
             else:
-                at = np.asarray(snap[0], np.float32)
+                at = np.asarray(snap[0], float)
                 axes = self.camera.right_up()
             segs = _snap_marker(snap[1], at, *axes, size * 0.95)
             self._preview.update(rebased(segs, self._frame_anchor))
@@ -3810,14 +3814,15 @@ class Viewport(QOpenGLWidget):
                     markers: list | None = None):
         """Segments: (K,2,3) rubber-band lines; markers: picked points."""
         if segments is None or len(segments) == 0:
-            self._preview_data = np.zeros((0, 3), np.float32)
+            self._preview_data = np.zeros((0, 3))
             self._draw_span = None
         else:
-            arr = np.asarray(segments, np.float32)
+            # float64 until rebased: float32 out at survey coordinates is
+            # a grid half a metre wide, and a short leg falls onto one node
+            arr = np.asarray(segments, float)
             # the last leg runs from the newest picked point to the cursor:
             # that is the length worth showing while you draw
-            self._draw_span = (arr[-1][0].astype(float),
-                               arr[-1][1].astype(float))
+            self._draw_span = (arr[-1][0].copy(), arr[-1][1].copy())
             self._preview_data = arr.reshape(-1, 3)
         self._marker_points = list(markers or [])
         # A leg and a frame are two answers to the same question, so setting
@@ -4304,7 +4309,8 @@ class Viewport(QOpenGLWidget):
                     self._eye(), px, py, self.width(), self.height(),
                     base_point=self.snap_base,
                     pending_points=self.pending_points,
-                    picked_points=self.picked_points)
+                    picked_points=self.picked_points,
+                    clip=self._clip_vectors(entered.id))
                 if snap is not None:
                     self._active_snap = snap
                     return snap[0]
@@ -4352,7 +4358,8 @@ class Viewport(QOpenGLWidget):
             snap = self.snaps.find(self.camera, px, py, self.width(),
                                    self.height(), base_point=self.snap_base,
                                    pending_points=self.pending_points,
-                                   picked_points=self.picked_points)
+                                   picked_points=self.picked_points,
+                                   clip=self._clip_vectors(self.view_key))
             if snap is not None:
                 self._active_snap = snap
                 t = float(np.dot(np.asarray(snap[0], float) - base, unit))
@@ -4369,7 +4376,8 @@ class Viewport(QOpenGLWidget):
         snap = self.snaps.find(self.camera, px, py, self.width(),
                                self.height(), base_point=self.snap_base,
                                pending_points=self.pending_points,
-                               picked_points=self.picked_points)
+                               picked_points=self.picked_points,
+                               clip=self._clip_vectors(self.view_key))
         if snap is not None:
             self._active_snap = snap
             return snap[0]
@@ -4525,6 +4533,32 @@ class Viewport(QOpenGLWidget):
         if self.selection.held and obj_id != self._choice_hover:
             return theme.HELD_SELECTION_COLOR
         return theme.SELECTION_COLOR
+
+    def flash(self, ids):
+        """Light these objects in the change colour for a moment, fading
+        back to their own: what Join or Explode made, so it is seen."""
+        now = time.monotonic()
+        self._flashes.update({obj_id: now for obj_id in ids})
+        self._flash_tick()
+
+    def _flash_tick(self):
+        now = time.monotonic()
+        self._flashes = {i: t for i, t in self._flashes.items()
+                         if now - t < theme.CHANGE_FLASH_SECONDS}
+        self.update()
+        if self._flashes:
+            QTimer.singleShot(16, self._flash_tick)
+
+    def _flash_amount(self, obj_id: str) -> float:
+        """1 while the flash holds, then fading to 0 when it is over."""
+        start = self._flashes.get(obj_id)
+        if start is None:
+            return 0.0
+        elapsed = time.monotonic() - start
+        if elapsed >= theme.CHANGE_FLASH_SECONDS:
+            return 0.0
+        fade = theme.CHANGE_FLASH_SECONDS - theme.CHANGE_FLASH_HOLD
+        return min(1.0, 1.0 - (elapsed - theme.CHANGE_FLASH_HOLD) / fade)
 
     def _looks_selected(self, obj_id: str) -> bool:
         """Drawn in the selection colour: either it is selected, or it is
@@ -4708,11 +4742,18 @@ class Viewport(QOpenGLWidget):
         Thinned first and moved out afterwards: a scan is held as offsets
         from where it stands, and building the whole of it in doubles to
         take every two-hundredth point would be the expensive half of a
-        click.
+        click. Only the points the view's clipping planes leave in sight.
         """
         n = len(mesh.local)
         stride = max(1, n // self.PICK_CLOUD_SAMPLE)
-        return mesh.to_world(mesh.local[::stride]).astype(float)
+        pts = mesh.to_world(mesh.local[::stride]).astype(float)
+        # what a clipping plane cut away is not there to be picked
+        view = self.clip_view()
+        clip = self._clip_vectors(view) if view is not None else []
+        if clip:
+            from ..core.snaps import in_sight
+            pts = pts[in_sight(pts, clip)]
+        return pts
 
     def _nearest_cloud_point(self, mesh, eye, px, py, w, h):
         """Depth of the cloud point nearest the cursor within the pick
@@ -6015,18 +6056,18 @@ def _axis_guide(base, direction, reach: float) -> np.ndarray:
     than a half-ray: the cursor is allowed back past the point it was
     taken from.
     """
-    b = np.asarray(base, np.float32)
-    d = np.asarray(direction, np.float32)
+    b = np.asarray(base, float)
+    d = np.asarray(direction, float)
     d = d / max(float(np.linalg.norm(d)), 1e-12)
-    return np.stack([b - reach * d, b + reach * d]).astype(np.float32)
+    return np.stack([b - reach * d, b + reach * d])
 
 
 def _snap_marker(kind: str, c: np.ndarray, right: np.ndarray,
                  up: np.ndarray, s: float) -> np.ndarray:
     """Snap marker glyphs, as GL_LINES vertex pairs."""
-    r = (right * s).astype(np.float32)
-    u = (up * s).astype(np.float32)
-    c = c.astype(np.float32)
+    r = np.asarray(right, float) * s
+    u = np.asarray(up, float) * s
+    c = np.asarray(c, float)
 
     def loop(pts):
         return [np.stack([pts[i], pts[(i + 1) % len(pts)]])
@@ -6058,7 +6099,7 @@ def _snap_marker(kind: str, c: np.ndarray, right: np.ndarray,
     else:                                 # near: slash
         segs = [np.stack([c - r - u, c + r + u]),
                 np.stack([c - r, c + r])]
-    return np.concatenate(segs).astype(np.float32)
+    return np.concatenate(segs)
 
 
 def _snap_marker_color(space: str) -> tuple[float, float, float, float]:
